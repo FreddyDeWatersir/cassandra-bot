@@ -367,7 +367,7 @@ class CassandraBot(ForecastBot):
         probs = parse_multiple_choice(reasoning, question.options)
         predicted_options = PredictedOptionList(
             options=[
-                PredictedOption(name=opt, probability=probs.get(opt, 1.0 / len(question.options)))
+                PredictedOption(option_name=opt, probability=probs.get(opt, 1.0 / len(question.options)))
                 for opt in question.options
             ]
         )
