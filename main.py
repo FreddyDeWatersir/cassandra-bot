@@ -1,10 +1,31 @@
+"""
+CassandraBot - Metaculus Forecasting Bot powered by Lightning Rod's Foresight v3.
+
+This bot bypasses litellm entirely for LLM calls, using the OpenAI-compatible
+API from Lightning Rod directly. This avoids litellm's provider routing issues
+with custom model names.
+
+The forecasting-tools library is still used for:
+- Loading questions from Metaculus
+- Submitting predictions to Metaculus
+- The ForecastBot orchestration (research -> forecast -> aggregate -> submit)
+- NumericDistribution CDF generation
+"""
+
 import argparse
 import asyncio
 import logging
+import os
+import re
 from datetime import datetime, timezone
-import dotenv
 from typing import Literal
 
+import dotenv
+import numpy as np
+
+dotenv.load_dotenv()
+
+from openai import OpenAI
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -25,105 +46,196 @@ from forecasting_tools import (
     PredictionAffirmed,
     BinaryPrediction,
     PredictedOptionList,
+    PredictedOption,
     ReasonedPrediction,
     SmartSearcher,
     clean_indents,
-    structure_output,
 )
 
-dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-class SpringTemplateBot2026(ForecastBot):
-    """
-    This is the template bot for Spring 2026 Metaculus AI Tournament.
-    This is a copy of what is used by Metaculus to run the Metac Bots in our benchmark, provided as a template for new bot makers.
-    This template is given as-is, and is use-at-your-own-risk.
-    We have covered most test cases in forecasting-tools it may be worth double checking key components locally.
-    So far our track record has been 1 mentionable bug per season (affecting forecasts for 1-2% of total questions)
+# ============================================================
+# FORESIGHT LLM WRAPPER
+# ============================================================
+# Direct OpenAI-compatible client for Lightning Rod's Foresight v3.
+# Bypasses litellm entirely to avoid provider routing issues.
+# ============================================================
 
-    Main changes since Fall:
-    - Additional prompting has been added to numeric questions to emphasize putting pecentile values in the correct order.
-    - Support for conditional and date questions has been added
-    - Note: Spring AIB will not use date/conditional questions, so these are only for forecasting on the main site as you wish.
+class ForesightLlm:
+    """Direct wrapper for Lightning Rod's Foresight API."""
 
-    The main entry point of this bot is `bot.forecast_on_tournament(tournament_id)` in the parent class.
-    See the script at the bottom of the file for more details on how to run the bot.
-    Ignoring the finer details, the general flow is:
-    - Load questions from Metaculus
-    - For each question
-        - Execute run_research a number of times equal to research_reports_per_question
-        - Execute respective run_forecast function `predictions_per_research_report * research_reports_per_question` times
-        - Aggregate the predictions
-        - Submit prediction (if publish_reports_to_metaculus is True)
-    - Return a list of ForecastReport objects
+    def __init__(self, temperature=0.3, max_tokens=4000, timeout=120):
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        api_key = os.getenv("LIGHTNINGROD_API_KEY")
+        if not api_key:
+            raise ValueError("LIGHTNINGROD_API_KEY not found!")
+        self.client = OpenAI(
+            base_url="https://api.lightningrod.ai/api/public/v1/openai",
+            api_key=api_key,
+            timeout=timeout,
+        )
 
-    Alternatively, you can use the MetaculusClient to make a custom filter of questions to forecast on
-    and forecast them with `bot.forecast_questions(questions)`
+    def _call_sync(self, prompt: str) -> str:
+        response = self.client.chat.completions.create(
+            model="LightningRodLabs/foresight-v3",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+        content = response.choices[0].message.content
+        if content is None:
+            raise ValueError("Empty response from Foresight v3")
+        return content
 
-    Only the research and forecast functions need to be implemented in ForecastBot subclasses,
-    though you may want to override other ForecastBot functions.
-    In this example, you can change the prompts to be whatever you want since,
-    structure_output uses an LLM to intelligently reformat the output into the needed structure.
+    async def invoke(self, prompt: str) -> str:
+        for attempt in range(3):
+            try:
+                result = await asyncio.to_thread(self._call_sync, prompt)
+                return result
+            except Exception as e:
+                logger.warning(f"Foresight API attempt {attempt + 1} failed: {e}")
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(2 ** attempt)
 
-    By default (i.e. 'tournament' mode), when you run this script, it will forecast on any open questions in the
-    primary bot tournament and MiniBench. If you want to forecast on only one or the other, you can remove one
-    of them from the 'tournament' mode code at the bottom of the file.
 
-    You can experiment with what models work best with your bot by using the `llms` parameter when initializing the bot.
-    You can initialize the bot with any number of models. For example,
-    ```python
-    my_bot = MyBot(
-        ...
-        llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-            "default": GeneralLlm(
-                model="openrouter/openai/gpt-4o", # "anthropic/claude-sonnet-4-20250514", etc (see docs for litellm)
-                temperature=0.3,
-                timeout=40,
-                allowed_tries=2,
-            ),
-            "summarizer": "openai/gpt-4o-mini",
-            "researcher": "asknews/news-summaries",
-            "parser": "openai/gpt-4o-mini",
-        },
+# ============================================================
+# PARSING HELPERS
+# ============================================================
+# Since we're not using GeneralLlm, we can't use structure_output
+# (which requires a GeneralLlm for parsing). Instead we parse
+# the LLM output directly with regex. This is what the
+# bot_from_scratch.py template does too.
+# ============================================================
+
+def parse_binary_probability(text: str) -> float:
+    """Extract probability from text like 'Probability: 35%'."""
+    # Look specifically for the "Probability: XX%" pattern first
+    specific_match = re.search(
+        r"(?:Probability|PROBABILITY)\s*:\s*(\d+(?:\.\d+)?)\s*%",
+        text
     )
-    ```
+    if specific_match:
+        prob = float(specific_match.group(1)) / 100.0
+        return max(0.01, min(0.99, prob))
+    
+    # Fallback: look for "Probability: 0.XX" (decimal format)
+    decimal_match = re.search(
+        r"(?:Probability|PROBABILITY)\s*:\s*(\d*\.\d+)",
+        text
+    )
+    if decimal_match:
+        prob = float(decimal_match.group(1))
+        if prob > 1:  # It was actually a percentage
+            prob = prob / 100.0
+        return max(0.01, min(0.99, prob))
+    
+    # Last resort: take the last percentage in the text
+    matches = re.findall(r"(\d+(?:\.\d+)?)\s*%", text)
+    if matches:
+        prob = float(matches[-1]) / 100.0
+        return max(0.01, min(0.99, prob))
+    
+    logger.warning("Could not parse probability, defaulting to 0.5")
+    return 0.5
 
-    Then you can access the model in custom functions like this:
-    ```python
-    research_strategy = self.get_llm("researcher", "model_name"
-    if research_strategy == "asknews/news-summaries":
-        ...
-    # OR
-    summarizer = await self.get_llm("summarizer", "llm").invoke(prompt)
-    # OR
-    reasoning = await self.get_llm("default", "llm").invoke(prompt)
-    ```
+def parse_percentiles(text: str) -> dict[float, float]:
+    """Extract percentile values from text in various formats."""
+    results = {}
+    
+    # Format 1: "Percentile 10: 115"
+    pattern1 = r"(?:P|p)ercentile\s*(\d+)\s*[:%]\s*[*]*\s*(-?\s*[\d,]+(?:\.\d+)?)"
+    for match in re.finditer(pattern1, text):
+        pct = float(match.group(1))
+        val = float(match.group(2).replace(",", "").replace(" ", ""))
+        results[pct] = val
 
-    If you end up having trouble with rate limits and want to try a more sophisticated rate limiter try:
-    ```python
-    from forecasting_tools import RefreshingBucketRateLimiter
-    rate_limiter = RefreshingBucketRateLimiter(
-        capacity=2,
-        refresh_rate=1,
-    ) # Allows 1 request per second on average with a burst of 2 requests initially. Set this as a class variable
-    await self.rate_limiter.wait_till_able_to_acquire_resources(1) # 1 because it's consuming 1 request (use more if you are adding a token limit)
-    ```
-    Additionally OpenRouter has large rate limits immediately on account creation
+    # Format 2: Markdown table "| 10 % | **115** |" or "| 10 % | 115 |"
+    if len(results) < 4:
+        pattern2 = r"\|\s*(\d+)\s*%?\s*\|\s*\**\s*[≈~]?\s*(-?[\d,]+(?:\.\d+)?)"
+        for match in re.finditer(pattern2, text):
+            pct = float(match.group(1))
+            val = float(match.group(2).replace(",", "").replace(" ", ""))
+            results[pct] = val
+
+    # Format 3: Code block "Percentile 10: 115"
+    if len(results) < 4:
+        pattern3 = r"(\d+)\s*%?\s*[:\|]\s*\**\s*(\d[\d,]*(?:\.\d+)?)"
+        for match in re.finditer(pattern3, text):
+            pct = float(match.group(1))
+            if 5 <= pct <= 95:  # Only valid percentiles
+                val = float(match.group(2).replace(",", ""))
+                results[pct] = val
+
+    return results
+
+
+def parse_multiple_choice(text: str, options: list[str]) -> dict[str, float]:
+    """Extract option probabilities from text."""
+    results = {}
+
+    # Try to find lines with option names and percentages
+    for option in options:
+        # Escape special regex characters in option name
+        escaped_option = re.escape(option)
+        patterns = [
+            rf"{escaped_option}\s*:\s*(\d+(?:\.\d+)?)\s*%",
+            rf"{escaped_option}\s*:\s*(\d+(?:\.\d+)?)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                results[option] = float(match.group(1))
+                break
+
+    # If we didn't find all options, try finding the last N numbers
+    if len(results) < len(options):
+        all_numbers = re.findall(r"(\d+(?:\.\d+)?)\s*%", text)
+        if len(all_numbers) >= len(options):
+            last_n = all_numbers[-len(options):]
+            results = {opt: float(num) for opt, num in zip(options, last_n)}
+
+    # Normalize to sum to 1
+    if results:
+        total = sum(results.values())
+        if total > 0:
+            results = {k: max(0.01, min(0.99, v / total)) for k, v in results.items()}
+            # Re-normalize after clamping
+            total = sum(results.values())
+            results = {k: v / total for k, v in results.items()}
+
+    # Fallback: equal probabilities
+    if not results or len(results) < len(options):
+        equal_prob = 1.0 / len(options)
+        results = {opt: equal_prob for opt in options}
+
+    return results
+
+
+# ============================================================
+# THE BOT
+# ============================================================
+
+class CassandraBot(ForecastBot):
+    """
+    CassandraBot - Forecasting bot powered by Lightning Rod's Foresight v3.
+
+    Uses direct OpenAI API calls instead of litellm for LLM inference.
     """
 
-    _max_concurrent_questions = (
-        1  # Set this to whatever works for your search-provider/ai-model rate limits
-    )
+    _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
-    _structure_output_validation_samples = 2
+
+    def __init__(self, *args, foresight: ForesightLlm = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.foresight = foresight or ForesightLlm()
 
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            research = ""
             researcher = self.get_llm("researcher")
 
             prompt = clean_indents(
@@ -143,32 +255,24 @@ class SpringTemplateBot2026(ForecastBot):
                 """
             )
 
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
+            if (
+                isinstance(researcher, str)
+                and researcher.startswith("asknews/")
             ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
+                try:
+                    research = await AskNewsSearcher().call_preconfigured_version(
+                        researcher, prompt
+                    )
+                except Exception as e:
+                    logger.warning(f"AskNews failed: {e}. Using Foresight for research.")
+                    research = await self.foresight.invoke(prompt)
             elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
+                # Use Foresight itself for basic reasoning about the question
+                research = await self.foresight.invoke(prompt)
             else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
-            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
+                research = await self.foresight.invoke(prompt)
+
+            logger.info(f"Found Research for URL {question.page_url}:\n{research[:200]}...")
             return research
 
     ##################################### BINARY QUESTIONS #####################################
@@ -186,12 +290,10 @@ class SpringTemplateBot2026(ForecastBot):
             Question background:
             {question.background_info}
 
-
             This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
             {question.resolution_criteria}
 
             {question.fine_print}
-
 
             Your research assistant says:
             {research}
@@ -205,32 +307,17 @@ class SpringTemplateBot2026(ForecastBot):
             (d) A brief description of a scenario that results in a Yes outcome.
 
             You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
-            {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
             """
         )
 
-        return await self._binary_prompt_to_forecast(question, prompt)
-
-    async def _binary_prompt_to_forecast(
-        self,
-        question: BinaryQuestion,
-        prompt: str,
-    ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self.foresight.invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning,
-            BinaryPrediction,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-        )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
 
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
-        )
+        decimal_pred = parse_binary_probability(reasoning)
+        logger.info(f"Forecasted URL {question.page_url} with prediction: {decimal_pred}")
+
         return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
 
     ##################################### MULTIPLE CHOICE QUESTIONS #####################################
@@ -247,14 +334,12 @@ class SpringTemplateBot2026(ForecastBot):
 
             The options are: {question.options}
 
-
             Background:
             {question.background_info}
 
             {question.resolution_criteria}
 
             {question.fine_print}
-
 
             Your research assistant says:
             {research}
@@ -264,50 +349,31 @@ class SpringTemplateBot2026(ForecastBot):
             Before answering you write:
             (a) The time left until the outcome to the question is known.
             (b) The status quo outcome if nothing changed.
-            (c) A description of an scenario that results in an unexpected outcome.
+            (c) A description of a scenario that results in an unexpected outcome.
 
-            {self._get_conditional_disclaimer_if_necessary(question)}
             You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
 
             The last thing you write is your final probabilities for the N options in this order {question.options} as:
-            Option_A: Probability_A
-            Option_B: Probability_B
+            Option_A: Probability_A%
+            Option_B: Probability_B%
             ...
-            Option_N: Probability_N
+            Option_N: Probability_N%
             """
         )
-        return await self._multiple_choice_prompt_to_forecast(question, prompt)
 
-    async def _multiple_choice_prompt_to_forecast(
-        self,
-        question: MultipleChoiceQuestion,
-        prompt: str,
-    ) -> ReasonedPrediction[PredictedOptionList]:
-        parsing_instructions = clean_indents(
-            f"""
-            Make sure that all option names are one of the following:
-            {question.options}
-
-            The text you are parsing may prepend these options with some variation of "Option" which you should remove if not part of the option names I just gave you.
-            Additionally, you may sometimes need to parse a 0% probability. Please do not skip options with 0% but rather make it an entry in your final list with 0% probability.
-            """
-        )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self.foresight.invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning,
-            output_type=PredictedOptionList,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-            additional_instructions=parsing_instructions,
+
+        probs = parse_multiple_choice(reasoning, question.options)
+        predicted_options = PredictedOptionList(
+            options=[
+                PredictedOption(name=opt, probability=probs.get(opt, 1.0 / len(question.options)))
+                for opt in question.options
+            ]
         )
 
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
-        )
-        return ReasonedPrediction(
-            prediction_value=predicted_option_list, reasoning=reasoning
-        )
+        logger.info(f"Forecasted URL {question.page_url} with prediction: {predicted_options}")
+        return ReasonedPrediction(prediction_value=predicted_options, reasoning=reasoning)
 
     ##################################### NUMERIC QUESTIONS #####################################
 
@@ -342,9 +408,9 @@ class SpringTemplateBot2026(ForecastBot):
             {upper_bound_message}
 
             Formatting Instructions:
-            - Please notice the units requested and give your answer in these units (e.g. whether you represent a number as 1,000,000 or 1 million).
+            - Please notice the units requested and give your answer in these units.
             - Never use scientific notation.
-            - Always start with a smaller number (more negative if negative) and then increase from there. The value for percentile 10 should always be less than the value for percentile 20, and so on.
+            - Always start with a smaller number and then increase from there. The value for percentile 10 should always be less than the value for percentile 20, and so on.
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
@@ -354,7 +420,6 @@ class SpringTemplateBot2026(ForecastBot):
             (e) A brief description of an unexpected scenario that results in a low outcome.
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
-            {self._get_conditional_disclaimer_if_necessary(question)}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
 
             The last thing you write is your final answer as:
@@ -368,39 +433,32 @@ class SpringTemplateBot2026(ForecastBot):
             "
             """
         )
-        return await self._numeric_prompt_to_forecast(question, prompt)
 
-    async def _numeric_prompt_to_forecast(
-        self,
-        question: NumericQuestion,
-        prompt: str,
-    ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self.foresight.invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        parsing_instructions = clean_indents(
-            f"""
-            The text given to you is trying to give a forecast distribution for a numeric question.
-            - This text is trying to answer the numeric question: "{question.question_text}".
-            - When parsing the text, please make sure to give the values (the ones assigned to percentiles) in terms of the correct units.
-            - The units for the forecast are: {question.unit_of_measure}
-            - Your work will be shown publicly with these units stated verbatim after the numbers your parse.
-            - As an example, someone else guessed that the answer will be between {question.lower_bound} {question.unit_of_measure} and {question.upper_bound} {question.unit_of_measure}, so the numbers parsed from an answer like this would be verbatim "{question.lower_bound}" and "{question.upper_bound}".
-            - If the answer doesn't give the answer in the correct units, you should parse it in the right units. For instance if the answer gives numbers as $500,000,000 and units are "B $" then you should parse the answer as 0.5 (since $500,000,000 is $0.5 billion).
-            - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
-            - Turn any values that are in scientific notation into regular numbers.
-            """
-        )
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning,
-            list[Percentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
-        )
+
+        percentile_values = parse_percentiles(reasoning)
+        if len(percentile_values) < 2:
+            raise ValueError(f"Could not parse enough percentiles from response. Got: {percentile_values}")
+
+        percentile_list = [
+            Percentile(percentile=p / 100.0, value=v)
+            for p, v in sorted(percentile_values.items())
+        ]
+
+        # Ensure values are in increasing order
+        for i in range(len(percentile_list) - 1):
+            if percentile_list[i].value >= percentile_list[i + 1].value:
+                logger.warning(f"Percentile values not in order, adjusting: {percentile_list}")
+                # Add small epsilon to fix ordering
+                percentile_list[i + 1] = Percentile(
+                    percentile=percentile_list[i + 1].percentile,
+                    value=percentile_list[i].value + 0.001,
+                )
+
         prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
-        )
+        logger.info(f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}")
+
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
     ##################################### DATE QUESTIONS #####################################
@@ -434,103 +492,56 @@ class SpringTemplateBot2026(ForecastBot):
             {upper_bound_message}
 
             Formatting Instructions:
-            - This is a date question, and as such, the answer must be expressed in terms of dates.
-            - The dates must be written in the format of YYYY-MM-DD. If hours matter, please append the date with the hour in UTC and military time: YYYY-MM-DDTHH:MM:SSZ.No other formatting is allowed.
-            - Always start with a lower date chronologically and then increase from there.
-            - Do NOT forget this. The dates must be written in chronological order starting at the earliest time at percentile 10 and increasing from there.
+            - This is a date question. Answer in YYYY-MM-DD format.
+            - Always start with an earlier date at percentile 10 and increase chronologically.
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
             (b) The outcome if nothing changed.
             (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
+            (d) A brief description of an unexpected scenario that results in an early outcome.
+            (e) A brief description of an unexpected scenario that results in a late outcome.
 
-            {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals.
 
             The last thing you write is your final answer as:
             "
-            Percentile 10: YYYY-MM-DD (oldest date)
+            Percentile 10: YYYY-MM-DD (earliest date)
             Percentile 20: YYYY-MM-DD
             Percentile 40: YYYY-MM-DD
             Percentile 60: YYYY-MM-DD
             Percentile 80: YYYY-MM-DD
-            Percentile 90: YYYY-MM-DD (newest date)
+            Percentile 90: YYYY-MM-DD (latest date)
             "
             """
         )
-        forecast = await self._date_prompt_to_forecast(question, prompt)
-        return forecast
 
-    async def _date_prompt_to_forecast(
-        self,
-        question: DateQuestion,
-        prompt: str,
-    ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self.foresight.invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        parsing_instructions = clean_indents(
-            f"""
-            The text given to you is trying to give a forecast distribution for a date question.
-            - This text is trying to answer the question: "{question.question_text}".
-            - As an example, someone else guessed that the answer will be between {question.lower_bound} and {question.upper_bound}, so the numbers parsed from an answer like this would be verbatim "{question.lower_bound}" and "{question.upper_bound}".
-            - The output is given as dates/times please format it into a valid datetime parsable string. Assume midnight UTC if no hour is given.
-            - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
-            """
-        )
-        date_percentile_list: list[DatePercentile] = await structure_output(
-            reasoning,
-            list[DatePercentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
-        )
 
-        percentile_list = [
-            Percentile(
-                percentile=percentile.percentile,
-                value=percentile.value.timestamp(),
+        # Parse dates from percentile lines
+        from datetime import datetime as dt
+        date_pattern = r"(?:P|p)ercentile\s*(\d+)\s*:\s*(\d{4}-\d{2}-\d{2})"
+        date_matches = re.findall(date_pattern, reasoning)
+
+        if len(date_matches) < 2:
+            raise ValueError(f"Could not parse enough date percentiles from response")
+
+        percentile_list = []
+        for pct_str, date_str in date_matches:
+            parsed_date = dt.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            percentile_list.append(
+                Percentile(
+                    percentile=float(pct_str) / 100.0,
+                    value=parsed_date.timestamp(),
+                )
             )
-            for percentile in date_percentile_list
-        ]
+
+        percentile_list.sort(key=lambda p: p.percentile)
         prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
-        )
+        logger.info(f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}")
+
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
-
-    def _create_upper_and_lower_bound_messages(
-        self, question: NumericQuestion | DateQuestion
-    ) -> tuple[str, str]:
-        if isinstance(question, NumericQuestion):
-            if question.nominal_upper_bound is not None:
-                upper_bound_number = question.nominal_upper_bound
-            else:
-                upper_bound_number = question.upper_bound
-            if question.nominal_lower_bound is not None:
-                lower_bound_number = question.nominal_lower_bound
-            else:
-                lower_bound_number = question.lower_bound
-            unit_of_measure = question.unit_of_measure
-        elif isinstance(question, DateQuestion):
-            upper_bound_number = question.upper_bound.date().isoformat()
-            lower_bound_number = question.lower_bound.date().isoformat()
-            unit_of_measure = ""
-        else:
-            raise ValueError()
-
-        if question.open_upper_bound:
-            upper_bound_message = f"The question creator thinks the number is likely not higher than {upper_bound_number} {unit_of_measure}."
-        else:
-            upper_bound_message = f"The outcome can not be higher than {upper_bound_number} {unit_of_measure}."
-
-        if question.open_lower_bound:
-            lower_bound_message = f"The question creator thinks the number is likely not lower than {lower_bound_number} {unit_of_measure}."
-        else:
-            lower_bound_message = f"The outcome can not be lower than {lower_bound_number} {unit_of_measure}."
-        return upper_bound_message, lower_bound_message
 
     ##################################### CONDITIONAL QUESTIONS #####################################
 
@@ -549,27 +560,23 @@ class SpringTemplateBot2026(ForecastBot):
         no_info, full_research = await self._get_question_prediction_info(
             question.question_no, full_research, "no"
         )
-        full_reasoning = clean_indents(
-            f"""
-            ## Parent Question Reasoning
-            {parent_info.reasoning}
-            ## Child Question Reasoning
-            {child_info.reasoning}
-            ## Yes Question Reasoning
-            {yes_info.reasoning}
-            ## No Question Reasoning
-            {no_info.reasoning}
-        """
-        )
+        full_reasoning = f"""
+## Parent Question Reasoning
+{parent_info.reasoning}
+## Child Question Reasoning
+{child_info.reasoning}
+## Yes Question Reasoning
+{yes_info.reasoning}
+## No Question Reasoning
+{no_info.reasoning}
+"""
         full_prediction = ConditionalPrediction(
-            parent=parent_info.prediction_value,  # type: ignore
-            child=child_info.prediction_value,  # type: ignore
-            prediction_yes=yes_info.prediction_value,  # type: ignore
-            prediction_no=no_info.prediction_value,  # type: ignore
+            parent=parent_info.prediction_value,
+            child=child_info.prediction_value,
+            prediction_yes=yes_info.prediction_value,
+            prediction_no=no_info.prediction_value,
         )
-        return ReasonedPrediction(
-            reasoning=full_reasoning, prediction_value=full_prediction
-        )
+        return ReasonedPrediction(reasoning=full_reasoning, prediction_value=full_prediction)
 
     async def _get_question_prediction_info(
         self, question: MetaculusQuestion, research: str, question_type: str
@@ -582,59 +589,70 @@ class SpringTemplateBot2026(ForecastBot):
             and previous_forecasts
             and question_type not in self.force_reforecast_in_conditional
         ):
-            # TODO: add option to not affirm current parent/child forecasts, create new forecast
             previous_forecast = previous_forecasts[-1]
             current_utc_time = datetime.now(timezone.utc)
             if (
                 previous_forecast.timestamp_end is None
                 or previous_forecast.timestamp_end > current_utc_time
             ):
-                pretty_value = DataOrganizer.get_readable_prediction(previous_forecast)  # type: ignore
+                pretty_value = DataOrganizer.get_readable_prediction(previous_forecast)
                 prediction = ReasonedPrediction(
                     prediction_value=PredictionAffirmed(),
                     reasoning=f"Already existing forecast reaffirmed at {pretty_value}.",
                 )
-                return (prediction, research)  # type: ignore
+                return (prediction, research)
         info = await self._make_prediction(question, research)
         full_research = self._add_reasoning_to_research(research, info, question_type)
-        return info, full_research  # type: ignore
+        return info, full_research
 
     def _add_reasoning_to_research(
-        self,
-        research: str,
-        reasoning: ReasonedPrediction[PredictionTypes],
-        question_type: str,
+        self, research: str, reasoning: ReasonedPrediction[PredictionTypes], question_type: str,
     ) -> str:
         from forecasting_tools.data_models.data_organizer import DataOrganizer
-
         question_type = question_type.title()
-        return clean_indents(
-            f"""
-            {research}
-            ---
-            ## {question_type} Question Information
-            You have previously forecasted the {question_type} Question to the value: {DataOrganizer.get_readable_prediction(reasoning.prediction_value)}
-            This is relevant information for your current forecast, but it is NOT your current forecast, but previous forecasting information that is relevant to your current forecast.
-            The reasoning for the {question_type} Question was as such:
-            ```
-            {reasoning.reasoning}
-            ```
-            This is absolutely essential: do NOT use this reasoning to re-forecast the {question_type} question.
-            """
-        )
+        return f"""{research}
+---
+## {question_type} Question Information
+You have previously forecasted the {question_type} Question to the value: {DataOrganizer.get_readable_prediction(reasoning.prediction_value)}
+"""
 
-    def _get_conditional_disclaimer_if_necessary(
-        self, question: MetaculusQuestion
-    ) -> str:
+    ##################################### HELPERS #####################################
+
+    def _create_upper_and_lower_bound_messages(
+        self, question: NumericQuestion | DateQuestion
+    ) -> tuple[str, str]:
+        if isinstance(question, NumericQuestion):
+            upper_bound_number = question.nominal_upper_bound or question.upper_bound
+            lower_bound_number = question.nominal_lower_bound or question.lower_bound
+            unit = question.unit_of_measure
+        elif isinstance(question, DateQuestion):
+            upper_bound_number = question.upper_bound.date().isoformat()
+            lower_bound_number = question.lower_bound.date().isoformat()
+            unit = ""
+        else:
+            raise ValueError()
+
+        if question.open_upper_bound:
+            upper_msg = f"The question creator thinks the number is likely not higher than {upper_bound_number} {unit}."
+        else:
+            upper_msg = f"The outcome can not be higher than {upper_bound_number} {unit}."
+
+        if question.open_lower_bound:
+            lower_msg = f"The question creator thinks the number is likely not lower than {lower_bound_number} {unit}."
+        else:
+            lower_msg = f"The outcome can not be lower than {lower_bound_number} {unit}."
+
+        return upper_msg, lower_msg
+
+    def _get_conditional_disclaimer_if_necessary(self, question: MetaculusQuestion) -> str:
         if question.conditional_type not in ["yes", "no"]:
             return ""
-        return clean_indents(
-            """
-            As you are given a conditional question with a parent and child, you are to only forecast the **CHILD** question, given the parent question's resolution.
-            You never re-forecast the parent question under any circumstances, but you use probabilistic reasoning, strongly considering the parent question's resolution, to forecast the child question.
-            """
-        )
+        return "As you are given a conditional question, only forecast the CHILD question given the parent question's resolution."
 
+
+# ============================================================
+# MAIN ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -642,30 +660,34 @@ if __name__ == "__main__":
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    # Suppress LiteLLM logging
-    litellm_logger = logging.getLogger("LiteLLM")
-    litellm_logger.setLevel(logging.WARNING)
-    litellm_logger.propagate = False
+    # Suppress noisy loggers
+    for noisy in ["LiteLLM", "openai.agents", "httpx", "httpcore"]:
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    parser = argparse.ArgumentParser(
-        description="Run the TemplateBot forecasting system"
-    )
+    parser = argparse.ArgumentParser(description="Run CassandraBot")
     parser.add_argument(
         "--mode",
         type=str,
         choices=["tournament", "metaculus_cup", "test_questions"],
         default="tournament",
-        help="Specify the run mode (default: tournament)",
     )
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
-    assert run_mode in [
-        "tournament",
-        "metaculus_cup",
-        "test_questions",
-    ], "Invalid run mode"
 
-    template_bot = SpringTemplateBot2026(
+    # ============================================================
+    # Initialize Foresight v3 - purpose-built forecasting model
+    # Beat o3, Grok 4, and Claude Opus on live prediction markets
+    # Cost: ~$0.05 per question (5 runs) = ~$25-35 for full tournament
+    # ============================================================
+
+    foresight = ForesightLlm(
+        temperature=0.3,
+        max_tokens=4000,
+        timeout=120,
+    )
+
+    cassandra_bot = CassandraBot(
+        foresight=foresight,
         research_reports_per_question=1,
         predictions_per_research_report=5,
         use_research_summary_to_forecast=False,
@@ -673,57 +695,53 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-            "default": GeneralLlm(
-                model="openrouter/openai/gpt-4o", # "anthropic/claude-sonnet-4-20250514", etc (see docs for litellm)
-                temperature=0.3,
-                max_tokens = 3000,
-                timeout=40,
-                allowed_tries=2,
-            ),
-            "summarizer": "openai/gpt-4o-mini",
-            "researcher": "asknews/news-summaries",
-            "parser": "openai/gpt-4o-mini",
+        llms={
+            # These are needed by the parent ForecastBot class
+            # but we override all the methods that use them
+            "default": "no_research",
+            "summarizer": "no_research",
+            "researcher": "no_research",
+            "parser": "no_research",
         },
     )
 
     client = MetaculusClient()
+
     if run_mode == "tournament":
-        # You may want to change this to the specific tournament ID you want to forecast on
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
+        seasonal_reports = asyncio.run(
+            cassandra_bot.forecast_on_tournament(
                 client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
             )
         )
         minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
+            cassandra_bot.forecast_on_tournament(
                 client.CURRENT_MINIBENCH_ID, return_exceptions=True
             )
         )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
+        forecast_reports = seasonal_reports + minibench_reports
+
     elif run_mode == "metaculus_cup":
-        # The Metaculus cup is a good way to test the bot's performance on regularly open questions. You can also use AXC_2025_TOURNAMENT_ID = 32564 or AI_2027_TOURNAMENT_ID = "ai-2027"
-        # The Metaculus cup may not be initialized near the beginning of a season (i.e. January, May, September)
-        template_bot.skip_previously_forecasted_questions = False
+        cassandra_bot.skip_previously_forecasted_questions = False
         forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
+            cassandra_bot.forecast_on_tournament(
                 client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
             )
         )
+
     elif run_mode == "test_questions":
-        # Example questions are a good way to test the bot's performance on a single question
         EXAMPLE_QUESTIONS = [
-            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
-            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
-            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Number of New Leading AI Labs - Multiple Choice
-            "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Number of US Labor Strikes Due to AI in 2029 - Discrete
+            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
+            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",
+            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
+            "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",
         ]
-        template_bot.skip_previously_forecasted_questions = False
+        cassandra_bot.skip_previously_forecasted_questions = False
+        cassandra_bot.publish_reports_to_metaculus = False
         questions = [
-            client.get_question_by_url(question_url)
-            for question_url in EXAMPLE_QUESTIONS
+            client.get_question_by_url(url) for url in EXAMPLE_QUESTIONS
         ]
         forecast_reports = asyncio.run(
-            template_bot.forecast_questions(questions, return_exceptions=True)
+            cassandra_bot.forecast_questions(questions, return_exceptions=True)
         )
-    template_bot.log_report_summary(forecast_reports)
+
+    cassandra_bot.log_report_summary(forecast_reports)
