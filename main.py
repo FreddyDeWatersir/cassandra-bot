@@ -145,27 +145,37 @@ def parse_percentiles(text: str) -> dict[float, float]:
     """Extract percentile values from text in various formats."""
     results = {}
     
-    # Format 1: "Percentile 10: 115"
-    pattern1 = r"(?:P|p)ercentile\s*(\d+)\s*[:%]\s*[*]*\s*(-?\s*[\d,]+(?:\.\d+)?)"
+    # Format 1: "Percentile 10: 115" or "Percentile 10: **115**"
+    pattern1 = r"(?:P|p)ercentile\s*(\d+)\s*[:%]\s*\**\s*[≈~]?\s*(-?\s*[\d,]+(?:\.\d+)?)"
     for match in re.finditer(pattern1, text):
         pct = float(match.group(1))
         val = float(match.group(2).replace(",", "").replace(" ", ""))
         results[pct] = val
 
-    # Format 2: Markdown table "| 10 % | **115** |" or "| 10 % | 115 |"
+    # Format 2: Markdown table "| 10 % | **115** |" or "| 10 | 115 |"
     if len(results) < 4:
         pattern2 = r"\|\s*(\d+)\s*%?\s*\|\s*\**\s*[≈~]?\s*(-?[\d,]+(?:\.\d+)?)"
         for match in re.finditer(pattern2, text):
             pct = float(match.group(1))
-            val = float(match.group(2).replace(",", "").replace(" ", ""))
-            results[pct] = val
+            if 5 <= pct <= 95:
+                val = float(match.group(2).replace(",", "").replace(" ", ""))
+                results[pct] = val
 
-    # Format 3: Code block "Percentile 10: 115"
+    # Format 3: "10%: 115" or "10 %  | **115**"
     if len(results) < 4:
-        pattern3 = r"(\d+)\s*%?\s*[:\|]\s*\**\s*(\d[\d,]*(?:\.\d+)?)"
+        pattern3 = r"(\d+)\s*%\s*[:\|]\s*\**\s*[≈~]?\s*(-?[\d,]+(?:\.\d+)?)"
         for match in re.finditer(pattern3, text):
             pct = float(match.group(1))
-            if 5 <= pct <= 95:  # Only valid percentiles
+            if 5 <= pct <= 95:
+                val = float(match.group(2).replace(",", ""))
+                results[pct] = val
+
+    # Format 4: Inside code blocks "Percentile 10: 115"
+    if len(results) < 4:
+        code_blocks = re.findall(r"```(.*?)```", text, re.DOTALL)
+        for block in code_blocks:
+            for match in re.finditer(r"(?:P|p)ercentile\s*(\d+)\s*:\s*(-?[\d,]+(?:\.\d+)?)", block):
+                pct = float(match.group(1))
                 val = float(match.group(2).replace(",", ""))
                 results[pct] = val
 
@@ -366,7 +376,7 @@ class CassandraBot(ForecastBot):
 
         probs = parse_multiple_choice(reasoning, question.options)
         predicted_options = PredictedOptionList(
-            options=[
+            predicted_options=[
                 PredictedOption(option_name=opt, probability=probs.get(opt, 1.0 / len(question.options)))
                 for opt in question.options
             ]
