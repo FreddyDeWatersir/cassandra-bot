@@ -448,8 +448,25 @@ class CassandraBot(ForecastBot):
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
 
         percentile_values = parse_percentiles(reasoning)
-        if len(percentile_values) < 2:
-            raise ValueError(f"Could not parse enough percentiles from response. Got: {percentile_values}")
+        # Fallback: if regex couldn't parse, ask Foresight to extract just the numbers
+        if len(percentile_values) < 4:
+            logger.warning(f"Regex parsing got only {len(percentile_values)} percentiles, using LLM fallback")
+            extraction_prompt = f"""Extract ONLY the percentile forecast values from the text below.
+Output EXACTLY in this format with nothing else:
+Percentile 10: [number]
+Percentile 20: [number]
+Percentile 40: [number]
+Percentile 60: [number]
+Percentile 80: [number]
+Percentile 90: [number]
+
+Text to extract from:
+{reasoning}"""
+            extraction = await self.foresight.invoke(extraction_prompt)
+            percentile_values = parse_percentiles(extraction)
+            
+            if len(percentile_values) < 2:
+                raise ValueError(f"Could not parse enough percentiles even with LLM fallback. Got: {percentile_values}")
 
         percentile_list = [
             Percentile(percentile=p / 100.0, value=v)
@@ -459,8 +476,7 @@ class CassandraBot(ForecastBot):
         # Ensure values are in increasing order
         for i in range(len(percentile_list) - 1):
             if percentile_list[i].value >= percentile_list[i + 1].value:
-                logger.warning(f"Percentile values not in order, adjusting: {percentile_list}")
-                # Add small epsilon to fix ordering
+                logger.warning(f"Percentile values not in order, adjusting")
                 percentile_list[i + 1] = Percentile(
                     percentile=percentile_list[i + 1].percentile,
                     value=percentile_list[i].value + 0.001,
