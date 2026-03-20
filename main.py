@@ -1,15 +1,21 @@
 """
-CassandraBot - Metaculus Forecasting Bot powered by Lightning Rod's Foresight v3.
+CassandraBot v2 - Multi-Model Ensemble Forecasting Bot
 
-This bot bypasses litellm entirely for LLM calls, using the OpenAI-compatible
-API from Lightning Rod directly. This avoids litellm's provider routing issues
-with custom model names.
+Architecture:
+1. RESEARCH: AskNews (latest + historical) with Foresight v3 fallback
+2. FORECAST: 6-model ensemble via OpenRouter + Lightning Rod direct API
+   - Models run in parallel with diverse prompting strategies
+   - Outside View / Inside View / Devil's Advocate perspectives
+3. AGGREGATE: Median (binary/MC) or mixture (numeric) + extremization
+4. SUBMIT: via forecasting-tools to Metaculus
 
-The forecasting-tools library is still used for:
-- Loading questions from Metaculus
-- Submitting predictions to Metaculus
-- The ForecastBot orchestration (research -> forecast -> aggregate -> submit)
-- NumericDistribution CDF generation
+Models in ensemble:
+  - Lightning Rod Foresight v3 (direct API, purpose-built forecaster)
+  - OpenAI o3 (strong reasoning)
+  - OpenAI GPT-5.4 (frontier general)
+  - Anthropic Claude Opus 4.6 (strongest complex reasoning)
+  - Anthropic Claude Sonnet 4.6 (fast, strong)
+  - Google Gemini 3.1 Pro (excellent reasoning, great value)
 """
 
 import argparse
@@ -17,6 +23,7 @@ import asyncio
 import logging
 import os
 import re
+import statistics
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -56,18 +63,16 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# FORESIGHT LLM WRAPPER
-# ============================================================
-# Direct OpenAI-compatible client for Lightning Rod's Foresight v3.
-# Bypasses litellm entirely to avoid provider routing issues.
+# LLM WRAPPERS
 # ============================================================
 
 class ForesightLlm:
-    """Direct wrapper for Lightning Rod's Foresight API."""
+    """Direct wrapper for Lightning Rod's Foresight API (bypasses litellm)."""
 
-    def __init__(self, temperature=0.3, max_tokens=4000, timeout=120):
+    def __init__(self, temperature=0.3, max_tokens=4000, timeout=180):
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.name = "foresight-v3"
         api_key = os.getenv("LIGHTNINGROD_API_KEY")
         if not api_key:
             raise ValueError("LIGHTNINGROD_API_KEY not found!")
@@ -101,18 +106,53 @@ class ForesightLlm:
                 await asyncio.sleep(2 ** attempt)
 
 
+class OpenRouterLlm:
+    """Wrapper for any model available on OpenRouter via OpenAI-compatible API."""
+
+    def __init__(self, model: str, temperature=0.3, max_tokens=4000, timeout=180):
+        self.model = model
+        self.name = model.split("/")[-1]  # e.g. "o3" from "openai/o3"
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise ValueError("OPENROUTER_API_KEY not found!")
+        self.client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+            timeout=timeout,
+        )
+
+    def _call_sync(self, prompt: str) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+        content = response.choices[0].message.content
+        if content is None:
+            raise ValueError(f"Empty response from {self.model}")
+        return content
+
+    async def invoke(self, prompt: str) -> str:
+        for attempt in range(3):
+            try:
+                result = await asyncio.to_thread(self._call_sync, prompt)
+                return result
+            except Exception as e:
+                logger.warning(f"{self.name} attempt {attempt + 1} failed: {e}")
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(2 ** attempt)
+
+
 # ============================================================
 # PARSING HELPERS
-# ============================================================
-# Since we're not using GeneralLlm, we can't use structure_output
-# (which requires a GeneralLlm for parsing). Instead we parse
-# the LLM output directly with regex. This is what the
-# bot_from_scratch.py template does too.
 # ============================================================
 
 def parse_binary_probability(text: str) -> float:
     """Extract probability from text like 'Probability: 35%'."""
-    # Look specifically for the "Probability: XX%" pattern first
     specific_match = re.search(
         r"(?:Probability|PROBABILITY)\s*:\s*(\d+(?:\.\d+)?)\s*%",
         text
@@ -120,31 +160,30 @@ def parse_binary_probability(text: str) -> float:
     if specific_match:
         prob = float(specific_match.group(1)) / 100.0
         return max(0.01, min(0.99, prob))
-    
-    # Fallback: look for "Probability: 0.XX" (decimal format)
+
     decimal_match = re.search(
         r"(?:Probability|PROBABILITY)\s*:\s*(\d*\.\d+)",
         text
     )
     if decimal_match:
         prob = float(decimal_match.group(1))
-        if prob > 1:  # It was actually a percentage
+        if prob > 1:
             prob = prob / 100.0
         return max(0.01, min(0.99, prob))
-    
-    # Last resort: take the last percentage in the text
+
     matches = re.findall(r"(\d+(?:\.\d+)?)\s*%", text)
     if matches:
         prob = float(matches[-1]) / 100.0
         return max(0.01, min(0.99, prob))
-    
+
     logger.warning("Could not parse probability, defaulting to 0.5")
     return 0.5
+
 
 def parse_percentiles(text: str) -> dict[float, float]:
     """Extract percentile values from text in various formats."""
     results = {}
-    
+
     # Format 1: "Percentile 10: 115" or "Percentile 10: **115**"
     pattern1 = r"(?:P|p)ercentile\s*(\d+)\s*[:%]\s*\**\s*[≈~]?\s*(-?\s*[\d,]+(?:\.\d+)?)"
     for match in re.finditer(pattern1, text):
@@ -152,7 +191,7 @@ def parse_percentiles(text: str) -> dict[float, float]:
         val = float(match.group(2).replace(",", "").replace(" ", ""))
         results[pct] = val
 
-    # Format 2: Markdown table "| 10 % | **115** |" or "| 10 | 115 |"
+    # Format 2: Markdown table "| 10 % | **115** |"
     if len(results) < 4:
         pattern2 = r"\|\s*(\d+)\s*%?\s*\|\s*\**\s*[≈~]?\s*(-?[\d,]+(?:\.\d+)?)"
         for match in re.finditer(pattern2, text):
@@ -161,7 +200,7 @@ def parse_percentiles(text: str) -> dict[float, float]:
                 val = float(match.group(2).replace(",", "").replace(" ", ""))
                 results[pct] = val
 
-    # Format 3: "10%: 115" or "10 %  | **115**"
+    # Format 3: "10%: 115"
     if len(results) < 4:
         pattern3 = r"(\d+)\s*%\s*[:\|]\s*\**\s*[≈~]?\s*(-?[\d,]+(?:\.\d+)?)"
         for match in re.finditer(pattern3, text):
@@ -170,7 +209,7 @@ def parse_percentiles(text: str) -> dict[float, float]:
                 val = float(match.group(2).replace(",", ""))
                 results[pct] = val
 
-    # Format 4: Inside code blocks "Percentile 10: 115"
+    # Format 4: Inside code blocks
     if len(results) < 4:
         code_blocks = re.findall(r"```(.*?)```", text, re.DOTALL)
         for block in code_blocks:
@@ -186,9 +225,7 @@ def parse_multiple_choice(text: str, options: list[str]) -> dict[str, float]:
     """Extract option probabilities from text."""
     results = {}
 
-    # Try to find lines with option names and percentages
     for option in options:
-        # Escape special regex characters in option name
         escaped_option = re.escape(option)
         patterns = [
             rf"{escaped_option}\s*:\s*(\d+(?:\.\d+)?)\s*%",
@@ -200,23 +237,19 @@ def parse_multiple_choice(text: str, options: list[str]) -> dict[str, float]:
                 results[option] = float(match.group(1))
                 break
 
-    # If we didn't find all options, try finding the last N numbers
     if len(results) < len(options):
         all_numbers = re.findall(r"(\d+(?:\.\d+)?)\s*%", text)
         if len(all_numbers) >= len(options):
             last_n = all_numbers[-len(options):]
             results = {opt: float(num) for opt, num in zip(options, last_n)}
 
-    # Normalize to sum to 1
     if results:
         total = sum(results.values())
         if total > 0:
             results = {k: max(0.01, min(0.99, v / total)) for k, v in results.items()}
-            # Re-normalize after clamping
             total = sum(results.values())
             results = {k: v / total for k, v in results.items()}
 
-    # Fallback: equal probabilities
     if not results or len(results) < len(options):
         equal_prob = 1.0 / len(options)
         results = {opt: equal_prob for opt in options}
@@ -225,167 +258,576 @@ def parse_multiple_choice(text: str, options: list[str]) -> dict[str, float]:
 
 
 # ============================================================
+# EXTREMIZATION
+# ============================================================
+
+def extremize(prob: float, factor: float = 1.4) -> float:
+    """
+    Push probabilities away from 0.5 toward 0 or 1.
+    Aggregated forecasts are systematically too moderate.
+    factor=1.0 means no change, >1.0 extremizes.
+    Typical range: 1.2-1.8. Tune via MiniBench.
+    """
+    if prob <= 0.01 or prob >= 0.99:
+        return prob
+    odds = prob / (1 - prob)
+    extremized_odds = odds ** factor
+    result = extremized_odds / (1 + extremized_odds)
+    return max(0.01, min(0.99, result))
+
+
+# ============================================================
+# PROMPT TEMPLATES
+# ============================================================
+# Three distinct perspectives to maximize ensemble diversity.
+# Each perspective asks the model to reason differently before
+# arriving at a probability.
+
+BINARY_OUTSIDE_VIEW = """You are an expert superforecaster using the OUTSIDE VIEW approach.
+
+Your interview question is:
+{question_text}
+
+Question background:
+{background_info}
+
+Resolution criteria (not yet satisfied):
+{resolution_criteria}
+
+{fine_print}
+
+Your research assistant says:
+{research}
+
+Today is {today}.
+
+{conditional_disclaimer}
+
+Use the OUTSIDE VIEW methodology:
+(a) What is the base rate for events like this? Find the reference class.
+(b) How much time is left until resolution?
+(c) What is the status quo outcome if nothing changes? Weight this heavily.
+(d) How often do similar predictions/events actually materialize?
+(e) Adjust from the base rate only if you have strong specific evidence.
+
+Good forecasters anchor heavily on base rates and the status quo, adjusting only modestly for specific evidence. The world changes slowly most of the time.
+
+The last thing you write is your final answer as: "Probability: ZZ%", 0-100
+"""
+
+BINARY_INSIDE_VIEW = """You are an expert superforecaster using the INSIDE VIEW approach.
+
+Your interview question is:
+{question_text}
+
+Question background:
+{background_info}
+
+Resolution criteria (not yet satisfied):
+{resolution_criteria}
+
+{fine_print}
+
+Your research assistant says:
+{research}
+
+Today is {today}.
+
+{conditional_disclaimer}
+
+Use the INSIDE VIEW methodology:
+(a) How much time remains until resolution?
+(b) What specific causal mechanisms would lead to Yes vs No?
+(c) What is the current trajectory and momentum of relevant factors?
+(d) What recent developments or evidence shift the probability?
+(e) Map out the specific steps needed for each outcome and assess their likelihood.
+
+Reason carefully through the specific causal chain. Consider what concrete events would need to happen and their individual probabilities.
+
+The last thing you write is your final answer as: "Probability: ZZ%", 0-100
+"""
+
+BINARY_DEVILS_ADVOCATE = """You are an expert superforecaster playing DEVIL'S ADVOCATE.
+
+Your interview question is:
+{question_text}
+
+Question background:
+{background_info}
+
+Resolution criteria (not yet satisfied):
+{resolution_criteria}
+
+{fine_print}
+
+Your research assistant says:
+{research}
+
+Today is {today}.
+
+{conditional_disclaimer}
+
+Use the DEVIL'S ADVOCATE methodology:
+(a) How much time remains until resolution?
+(b) What is the consensus/obvious answer? State it clearly.
+(c) Now argue AGAINST the consensus. What are the strongest reasons it could be wrong?
+(d) What unexpected scenarios could flip the outcome?
+(e) What are forecasters most likely to overlook or underweight?
+(f) After considering contrarian arguments, give your honest revised estimate.
+
+Good forecasters consider tail risks and contrarian scenarios seriously. The crowd is often right, but sometimes systematically wrong.
+
+The last thing you write is your final answer as: "Probability: ZZ%", 0-100
+"""
+
+
+MC_PROMPT = """You are a professional forecaster interviewing for a job.
+
+Your interview question is:
+{question_text}
+
+The options are: {options}
+
+Background:
+{background_info}
+
+{resolution_criteria}
+
+{fine_print}
+
+Your research assistant says:
+{research}
+
+Today is {today}.
+
+{view_instruction}
+
+{conditional_disclaimer}
+
+Before answering you write:
+(a) The time left until the outcome to the question is known.
+(b) The status quo outcome if nothing changed.
+(c) A description of a scenario that results in an unexpected outcome.
+
+You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
+
+The last thing you write is your final probabilities for the N options in this order {options} as:
+Option_A: Probability_A%
+Option_B: Probability_B%
+...
+Option_N: Probability_N%
+"""
+
+
+NUMERIC_PROMPT = """You are a professional forecaster interviewing for a job.
+
+Your interview question is:
+{question_text}
+
+Background:
+{background_info}
+
+{resolution_criteria}
+
+{fine_print}
+
+Units for answer: {unit_of_measure}
+
+Your research assistant says:
+{research}
+
+Today is {today}.
+
+{lower_bound_message}
+{upper_bound_message}
+
+{view_instruction}
+
+{conditional_disclaimer}
+
+Formatting Instructions:
+- Please notice the units requested and give your answer in these units.
+- Never use scientific notation.
+- Always start with a smaller number and then increase from there.
+
+Before answering you write:
+(a) The time left until the outcome to the question is known.
+(b) The outcome if nothing changed.
+(c) The outcome if the current trend continued.
+(d) The expectations of experts and markets.
+(e) A brief description of an unexpected scenario that results in a low outcome.
+(f) A brief description of an unexpected scenario that results in a high outcome.
+
+You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+
+The last thing you write is your final answer as:
+"
+Percentile 10: XX (lowest number value)
+Percentile 20: XX
+Percentile 40: XX
+Percentile 60: XX
+Percentile 80: XX
+Percentile 90: XX (highest number value)
+"
+"""
+
+DATE_PROMPT = """You are a professional forecaster interviewing for a job.
+
+Your interview question is:
+{question_text}
+
+Background:
+{background_info}
+
+{resolution_criteria}
+
+{fine_print}
+
+Your research assistant says:
+{research}
+
+Today is {today}.
+
+{lower_bound_message}
+{upper_bound_message}
+
+{conditional_disclaimer}
+
+Formatting Instructions:
+- This is a date question. Answer in YYYY-MM-DD format.
+- Always start with an earlier date at percentile 10 and increase chronologically.
+
+Before answering you write:
+(a) The time left until the outcome to the question is known.
+(b) The outcome if nothing changed.
+(c) The outcome if the current trend continued.
+(d) A brief description of an unexpected scenario that results in an early outcome.
+(e) A brief description of an unexpected scenario that results in a late outcome.
+
+You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals.
+
+The last thing you write is your final answer as:
+"
+Percentile 10: YYYY-MM-DD (earliest date)
+Percentile 20: YYYY-MM-DD
+Percentile 40: YYYY-MM-DD
+Percentile 60: YYYY-MM-DD
+Percentile 80: YYYY-MM-DD
+Percentile 90: YYYY-MM-DD (latest date)
+"
+"""
+
+
+# View instructions for prompt diversity on non-binary question types
+VIEW_INSTRUCTIONS = {
+    "outside": "Use the OUTSIDE VIEW: anchor on base rates and historical reference classes. What usually happens in situations like this? Adjust only modestly from the base rate.",
+    "inside": "Use the INSIDE VIEW: reason through the specific causal mechanisms and current evidence. What does the trajectory of current events suggest?",
+    "advocate": "Play DEVIL'S ADVOCATE: consider what the consensus might get wrong. What tail risks or overlooked factors could shift the outcome?",
+}
+
+
+# ============================================================
 # THE BOT
 # ============================================================
 
 class CassandraBot(ForecastBot):
     """
-    CassandraBot - Forecasting bot powered by Lightning Rod's Foresight v3.
+    CassandraBot v2 - Multi-model ensemble forecasting bot.
 
-    Uses direct OpenAI API calls instead of litellm for LLM inference.
+    Runs each question through multiple frontier models with diverse
+    prompting strategies, then aggregates via median + extremization.
     """
 
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
-    def __init__(self, *args, foresight: ForesightLlm = None, **kwargs):
+    # Limit concurrent model calls to avoid rate limits
+    _model_call_semaphore = asyncio.Semaphore(4)
+
+    # Tune this via MiniBench. Range: 1.0 (no extremization) to 2.0 (aggressive)
+    EXTREMIZE_FACTOR = 1.4
+
+    def __init__(self, *args, ensemble_models: list = None, foresight: ForesightLlm = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.foresight = foresight or ForesightLlm()
 
-    ##################################### RESEARCH #####################################
+        if ensemble_models is not None:
+            self.ensemble_models = ensemble_models
+        else:
+            # Build default ensemble from available API keys
+            self.ensemble_models = [self.foresight]
 
-    async def run_research(self, question: MetaculusQuestion) -> str:
-        async with self._concurrency_limiter:
-            researcher = self.get_llm("researcher")
+            openrouter_key = os.getenv("OPENROUTER_API_KEY")
+            if openrouter_key:
+                openrouter_models = [
+                    "openai/o3",                    # Strong reasoning
+                    "openai/gpt-5.4",               # Frontier general model
+                    "anthropic/claude-opus-4.6",     # Strongest complex reasoning
+                    "anthropic/claude-sonnet-4.6",   # Fast, strong, good value
+                    "google/gemini-3.1-pro",         # Excellent reasoning, great value
+                ]
+                for model_name in openrouter_models:
+                    try:
+                        self.ensemble_models.append(
+                            OpenRouterLlm(model=model_name, temperature=0.3, max_tokens=4000)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Could not initialize {model_name}: {e}")
+            else:
+                logger.warning("OPENROUTER_API_KEY not set - running Foresight-only (no ensemble)")
 
-            prompt = clean_indents(
-                f"""
-                You are an assistant to a superforecaster.
-                The superforecaster will give you a question they intend to forecast on.
-                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-                You do not produce forecasts yourself.
-
-                Question:
-                {question.question_text}
-
-                This question's outcome will be determined by the specific criteria below:
-                {question.resolution_criteria}
-
-                {question.fine_print}
-                """
+            logger.info(
+                f"Ensemble initialized with {len(self.ensemble_models)} models: "
+                f"{[m.name for m in self.ensemble_models]}"
             )
 
-            if (
-                isinstance(researcher, str)
-                and researcher.startswith("asknews/")
-            ):
-                try:
-                    research = await AskNewsSearcher().call_preconfigured_version(
-                        researcher, prompt
-                    )
-                except Exception as e:
-                    logger.warning(f"AskNews failed: {e}. Using Foresight for research.")
-                    research = await self.foresight.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                # Use Foresight itself for basic reasoning about the question
-                research = await self.foresight.invoke(prompt)
-            else:
-                research = await self.foresight.invoke(prompt)
+    # ======================== RESEARCH ========================
 
-            logger.info(f"Found Research for URL {question.page_url}:\n{research[:200]}...")
+    async def run_research(self, question: MetaculusQuestion) -> str:
+        """
+        Multi-source research pipeline:
+        1. AskNews latest news search
+        2. AskNews historical/knowledge search
+        3. Foresight v3 reasoning fallback if no AskNews
+        """
+        async with self._concurrency_limiter:
+            research_parts = []
+
+            # --- AskNews: try both latest and historical ---
+            asknews_client_id = os.getenv("ASKNEWS_CLIENT_ID")
+            asknews_secret = os.getenv("ASKNEWS_SECRET")
+            if asknews_client_id and asknews_secret:
+                try:
+                    from asknews_sdk import AsyncAskNewsSDK
+
+                    ask = AsyncAskNewsSDK(
+                        client_id=asknews_client_id,
+                        client_secret=asknews_secret,
+                        scopes=["chat", "news", "stories", "analytics"],
+                    )
+
+                    # Latest news
+                    try:
+                        latest = await ask.news.search_news(
+                            query=question.question_text,
+                            n_articles=5,
+                            return_type="both",
+                            strategy="latest news",
+                        )
+                        if latest.as_string:
+                            research_parts.append(
+                                f"=== LATEST NEWS ===\n{latest.as_string}"
+                            )
+                            logger.info(f"AskNews latest: got {len(latest.as_string)} chars")
+                    except Exception as e:
+                        logger.warning(f"AskNews latest search failed: {e}")
+
+                    # Historical / knowledge search (past 60 days archive)
+                    try:
+                        historical = await ask.news.search_news(
+                            query=question.question_text,
+                            n_articles=10,
+                            return_type="both",
+                            strategy="news knowledge",
+                        )
+                        if historical.as_string:
+                            research_parts.append(
+                                f"=== HISTORICAL NEWS & CONTEXT ===\n{historical.as_string}"
+                            )
+                            logger.info(f"AskNews historical: got {len(historical.as_string)} chars")
+                    except Exception as e:
+                        logger.warning(f"AskNews historical search failed: {e}")
+
+                except ImportError:
+                    logger.warning("asknews_sdk not installed, skipping AskNews")
+                except Exception as e:
+                    logger.warning(f"AskNews initialization failed: {e}")
+            else:
+                logger.info("AskNews credentials not found, skipping AskNews research")
+
+            # --- Fallback: if no AskNews results, use Foresight for basic research ---
+            if not research_parts:
+                logger.info("No AskNews results, falling back to Foresight v3 for research")
+                fallback_prompt = clean_indents(
+                    f"""
+                    You are a research assistant to a superforecaster.
+                    Generate a concise but detailed rundown of the most relevant facts,
+                    news, and context for this forecasting question. Include base rates
+                    and historical precedents where possible. You do not produce forecasts yourself.
+
+                    Question:
+                    {question.question_text}
+
+                    Resolution criteria:
+                    {question.resolution_criteria}
+
+                    {question.fine_print}
+                    """
+                )
+                fallback_research = await self.foresight.invoke(fallback_prompt)
+                research_parts.append(f"=== RESEARCH CONTEXT ===\n{fallback_research}")
+
+            research = "\n\n".join(research_parts)
+            logger.info(f"Research for {question.page_url}: {len(research)} chars total")
             return research
 
-    ##################################### BINARY QUESTIONS #####################################
+    # ======================== ENSEMBLE HELPERS ========================
+
+    async def _call_model_safe(self, model, prompt: str) -> str | None:
+        """Call a model with semaphore and error handling. Returns None on failure."""
+        async with self._model_call_semaphore:
+            try:
+                return await model.invoke(prompt)
+            except Exception as e:
+                logger.warning(f"Model {model.name} failed: {e}")
+                return None
+
+    def _assign_perspectives(self, models: list) -> list[tuple]:
+        """
+        Assign prompt perspectives to models, cycling through
+        outside/inside/advocate to maximize diversity.
+        """
+        perspectives = ["outside", "inside", "advocate"]
+        return [
+            (model, perspectives[i % len(perspectives)])
+            for i, model in enumerate(models)
+        ]
+
+    # ======================== BINARY QUESTIONS ========================
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
+        today = datetime.now().strftime("%Y-%m-%d")
+        conditional_disclaimer = self._get_conditional_disclaimer_if_necessary(question)
 
-            Your interview question is:
-            {question.question_text}
+        prompt_templates = {
+            "outside": BINARY_OUTSIDE_VIEW,
+            "inside": BINARY_INSIDE_VIEW,
+            "advocate": BINARY_DEVILS_ADVOCATE,
+        }
 
-            Question background:
-            {question.background_info}
+        model_assignments = self._assign_perspectives(self.ensemble_models)
 
-            This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
-            {question.resolution_criteria}
+        # Fire all model calls in parallel
+        tasks = []
+        task_labels = []
+        for model, perspective in model_assignments:
+            prompt = prompt_templates[perspective].format(
+                question_text=question.question_text,
+                background_info=question.background_info or "",
+                resolution_criteria=question.resolution_criteria or "",
+                fine_print=question.fine_print or "",
+                research=research,
+                today=today,
+                conditional_disclaimer=conditional_disclaimer,
+            )
+            tasks.append(self._call_model_safe(model, prompt))
+            task_labels.append(f"{model.name}({perspective})")
 
-            {question.fine_print}
+        responses = await asyncio.gather(*tasks)
 
-            Your research assistant says:
-            {research}
+        # Parse probabilities from successful responses
+        all_probs = []
+        all_reasonings = []
+        for label, response in zip(task_labels, responses):
+            if response is not None:
+                prob = parse_binary_probability(response)
+                all_probs.append(prob)
+                all_reasonings.append(f"### {label}: {prob:.1%}\n{response[:500]}...")
+                logger.info(f"  {label} -> {prob:.1%}")
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+        if not all_probs:
+            raise ValueError("All ensemble models failed for binary question")
 
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A brief description of a scenario that results in a No outcome.
-            (d) A brief description of a scenario that results in a Yes outcome.
+        # Aggregate: median + extremize
+        median_prob = statistics.median(all_probs)
+        final_prob = extremize(median_prob, self.EXTREMIZE_FACTOR)
+        final_prob = max(0.01, min(0.99, final_prob))
 
-            You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
-
-            The last thing you write is your final answer as: "Probability: ZZ%", 0-100
-            """
+        combined_reasoning = (
+            f"## Ensemble Forecast ({len(all_probs)} models)\n"
+            f"Individual predictions: {[f'{p:.1%}' for p in all_probs]}\n"
+            f"Median: {median_prob:.1%} -> Extremized ({self.EXTREMIZE_FACTOR}): {final_prob:.1%}\n\n"
+            + "\n\n".join(all_reasonings)
         )
 
-        reasoning = await self.foresight.invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        logger.info(
+            f"Binary ensemble for {question.page_url}: "
+            f"preds={[round(p,3) for p in all_probs]} median={median_prob:.3f} final={final_prob:.3f}"
+        )
+        return ReasonedPrediction(prediction_value=final_prob, reasoning=combined_reasoning)
 
-        decimal_pred = parse_binary_probability(reasoning)
-        logger.info(f"Forecasted URL {question.page_url} with prediction: {decimal_pred}")
-
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
-
-    ##################################### MULTIPLE CHOICE QUESTIONS #####################################
+    # ======================== MULTIPLE CHOICE QUESTIONS ========================
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
+        today = datetime.now().strftime("%Y-%m-%d")
+        conditional_disclaimer = self._get_conditional_disclaimer_if_necessary(question)
+        model_assignments = self._assign_perspectives(self.ensemble_models)
 
-            Your interview question is:
-            {question.question_text}
+        tasks = []
+        task_labels = []
+        for model, perspective in model_assignments:
+            prompt = MC_PROMPT.format(
+                question_text=question.question_text,
+                options=question.options,
+                background_info=question.background_info or "",
+                resolution_criteria=question.resolution_criteria or "",
+                fine_print=question.fine_print or "",
+                research=research,
+                today=today,
+                view_instruction=VIEW_INSTRUCTIONS[perspective],
+                conditional_disclaimer=conditional_disclaimer,
+            )
+            tasks.append(self._call_model_safe(model, prompt))
+            task_labels.append(f"{model.name}({perspective})")
 
-            The options are: {question.options}
+        responses = await asyncio.gather(*tasks)
 
-            Background:
-            {question.background_info}
+        all_option_probs = []  # list of dicts
+        all_reasonings = []
+        for label, response in zip(task_labels, responses):
+            if response is not None:
+                probs = parse_multiple_choice(response, question.options)
+                all_option_probs.append(probs)
+                all_reasonings.append(f"### {label}\n{response[:500]}...")
+                logger.info(f"  {label} -> {probs}")
 
-            {question.resolution_criteria}
+        if not all_option_probs:
+            raise ValueError("All ensemble models failed for MC question")
 
-            {question.fine_print}
+        # Aggregate: normalized median per option
+        final_probs = {}
+        for option in question.options:
+            option_values = [d[option] for d in all_option_probs if option in d]
+            final_probs[option] = statistics.median(option_values) if option_values else 1.0 / len(question.options)
 
-            Your research assistant says:
-            {research}
+        # Normalize
+        total = sum(final_probs.values())
+        if total > 0:
+            final_probs = {k: max(0.01, v / total) for k, v in final_probs.items()}
+            total = sum(final_probs.values())
+            final_probs = {k: v / total for k, v in final_probs.items()}
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
-
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A description of a scenario that results in an unexpected outcome.
-
-            You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
-
-            The last thing you write is your final probabilities for the N options in this order {question.options} as:
-            Option_A: Probability_A%
-            Option_B: Probability_B%
-            ...
-            Option_N: Probability_N%
-            """
-        )
-
-        reasoning = await self.foresight.invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-
-        probs = parse_multiple_choice(reasoning, question.options)
         predicted_options = PredictedOptionList(
             predicted_options=[
-                PredictedOption(option_name=opt, probability=probs.get(opt, 1.0 / len(question.options)))
+                PredictedOption(option_name=opt, probability=final_probs[opt])
                 for opt in question.options
             ]
         )
 
-        logger.info(f"Forecasted URL {question.page_url} with prediction: {predicted_options}")
-        return ReasonedPrediction(prediction_value=predicted_options, reasoning=reasoning)
+        combined_reasoning = (
+            f"## Ensemble MC Forecast ({len(all_option_probs)} models)\n"
+            f"Final: {final_probs}\n\n"
+            + "\n\n".join(all_reasonings)
+        )
 
-    ##################################### NUMERIC QUESTIONS #####################################
+        logger.info(f"MC ensemble for {question.page_url}: {final_probs}")
+        return ReasonedPrediction(prediction_value=predicted_options, reasoning=combined_reasoning)
+
+    # ======================== NUMERIC QUESTIONS ========================
 
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
@@ -393,65 +835,41 @@ class CassandraBot(ForecastBot):
         upper_bound_message, lower_bound_message = (
             self._create_upper_and_lower_bound_messages(question)
         )
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
+        today = datetime.now().strftime("%Y-%m-%d")
+        conditional_disclaimer = self._get_conditional_disclaimer_if_necessary(question)
+        model_assignments = self._assign_perspectives(self.ensemble_models)
 
-            Your interview question is:
-            {question.question_text}
+        tasks = []
+        task_labels = []
+        for model, perspective in model_assignments:
+            prompt = NUMERIC_PROMPT.format(
+                question_text=question.question_text,
+                background_info=question.background_info or "",
+                resolution_criteria=question.resolution_criteria or "",
+                fine_print=question.fine_print or "",
+                unit_of_measure=question.unit_of_measure or "Not stated (please infer)",
+                research=research,
+                today=today,
+                lower_bound_message=lower_bound_message,
+                upper_bound_message=upper_bound_message,
+                view_instruction=VIEW_INSTRUCTIONS[perspective],
+                conditional_disclaimer=conditional_disclaimer,
+            )
+            tasks.append(self._call_model_safe(model, prompt))
+            task_labels.append(f"{model.name}({perspective})")
 
-            Background:
-            {question.background_info}
+        responses = await asyncio.gather(*tasks)
 
-            {question.resolution_criteria}
-
-            {question.fine_print}
-
-            Units for answer: {question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"}
-
-            Your research assistant says:
-            {research}
-
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
-
-            {lower_bound_message}
-            {upper_bound_message}
-
-            Formatting Instructions:
-            - Please notice the units requested and give your answer in these units.
-            - Never use scientific notation.
-            - Always start with a smaller number and then increase from there. The value for percentile 10 should always be less than the value for percentile 20, and so on.
-
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
-
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
-
-            The last thing you write is your final answer as:
-            "
-            Percentile 10: XX (lowest number value)
-            Percentile 20: XX
-            Percentile 40: XX
-            Percentile 60: XX
-            Percentile 80: XX
-            Percentile 90: XX (highest number value)
-            "
-            """
-        )
-
-        reasoning = await self.foresight.invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-
-        percentile_values = parse_percentiles(reasoning)
-        # Fallback: if regex couldn't parse, ask Foresight to extract just the numbers
-        if len(percentile_values) < 4:
-            logger.warning(f"Regex parsing got only {len(percentile_values)} percentiles, using LLM fallback")
-            extraction_prompt = f"""Extract ONLY the percentile forecast values from the text below.
+        # Collect percentile dicts from each model
+        all_percentile_sets = []
+        all_reasonings = []
+        for label, response in zip(task_labels, responses):
+            if response is None:
+                continue
+            pvals = parse_percentiles(response)
+            if len(pvals) < 4:
+                # LLM fallback re-prompt for extraction
+                extraction_prompt = f"""Extract ONLY the percentile forecast values from the text below.
 Output EXACTLY in this format with nothing else:
 Percentile 10: [number]
 Percentile 20: [number]
@@ -461,33 +879,58 @@ Percentile 80: [number]
 Percentile 90: [number]
 
 Text to extract from:
-{reasoning}"""
-            extraction = await self.foresight.invoke(extraction_prompt)
-            percentile_values = parse_percentiles(extraction)
-            
-            if len(percentile_values) < 2:
-                raise ValueError(f"Could not parse enough percentiles even with LLM fallback. Got: {percentile_values}")
+{response}"""
+                try:
+                    extraction = await self.foresight.invoke(extraction_prompt)
+                    pvals = parse_percentiles(extraction)
+                except Exception:
+                    pass
+
+            if len(pvals) >= 4:
+                all_percentile_sets.append(pvals)
+                all_reasonings.append(f"### {label}\n{response[:500]}...")
+                logger.info(f"  {label} -> {pvals}")
+            else:
+                logger.warning(f"  {label}: only got {len(pvals)} percentiles, skipping")
+
+        if not all_percentile_sets:
+            raise ValueError("All ensemble models failed for numeric question")
+
+        # Aggregate: median at each percentile level
+        standard_pcts = [10, 20, 40, 60, 80, 90]
+        merged = {}
+        for pct in standard_pcts:
+            values = [ps[pct] for ps in all_percentile_sets if pct in ps]
+            if values:
+                merged[pct] = statistics.median(values)
+
+        if len(merged) < 2:
+            raise ValueError(f"Not enough merged percentiles: {merged}")
 
         percentile_list = [
             Percentile(percentile=p / 100.0, value=v)
-            for p, v in sorted(percentile_values.items())
+            for p, v in sorted(merged.items())
         ]
 
-        # Ensure values are in increasing order
+        # Ensure strictly increasing
         for i in range(len(percentile_list) - 1):
             if percentile_list[i].value >= percentile_list[i + 1].value:
-                logger.warning(f"Percentile values not in order, adjusting")
                 percentile_list[i + 1] = Percentile(
                     percentile=percentile_list[i + 1].percentile,
                     value=percentile_list[i].value + 0.001,
                 )
 
         prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}")
+        combined_reasoning = (
+            f"## Ensemble Numeric Forecast ({len(all_percentile_sets)} models)\n"
+            f"Merged percentiles: {merged}\n\n"
+            + "\n\n".join(all_reasonings)
+        )
 
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        logger.info(f"Numeric ensemble for {question.page_url}: {merged}")
+        return ReasonedPrediction(prediction_value=prediction, reasoning=combined_reasoning)
 
-    ##################################### DATE QUESTIONS #####################################
+    # ======================== DATE QUESTIONS ========================
 
     async def _run_forecast_on_date(
         self, question: DateQuestion, research: str
@@ -495,81 +938,112 @@ Text to extract from:
         upper_bound_message, lower_bound_message = (
             self._create_upper_and_lower_bound_messages(question)
         )
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
+        today = datetime.now().strftime("%Y-%m-%d")
+        conditional_disclaimer = self._get_conditional_disclaimer_if_necessary(question)
+        model_assignments = self._assign_perspectives(self.ensemble_models)
 
-            Your interview question is:
-            {question.question_text}
+        tasks = []
+        task_labels = []
+        for model, perspective in model_assignments:
+            prompt = DATE_PROMPT.format(
+                question_text=question.question_text,
+                background_info=question.background_info or "",
+                resolution_criteria=question.resolution_criteria or "",
+                fine_print=question.fine_print or "",
+                research=research,
+                today=today,
+                lower_bound_message=lower_bound_message,
+                upper_bound_message=upper_bound_message,
+                conditional_disclaimer=conditional_disclaimer,
+            )
+            tasks.append(self._call_model_safe(model, prompt))
+            task_labels.append(f"{model.name}({perspective})")
 
-            Background:
-            {question.background_info}
+        responses = await asyncio.gather(*tasks)
 
-            {question.resolution_criteria}
-
-            {question.fine_print}
-
-            Your research assistant says:
-            {research}
-
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
-
-            {lower_bound_message}
-            {upper_bound_message}
-
-            Formatting Instructions:
-            - This is a date question. Answer in YYYY-MM-DD format.
-            - Always start with an earlier date at percentile 10 and increase chronologically.
-
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) A brief description of an unexpected scenario that results in an early outcome.
-            (e) A brief description of an unexpected scenario that results in a late outcome.
-
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals.
-
-            The last thing you write is your final answer as:
-            "
-            Percentile 10: YYYY-MM-DD (earliest date)
-            Percentile 20: YYYY-MM-DD
-            Percentile 40: YYYY-MM-DD
-            Percentile 60: YYYY-MM-DD
-            Percentile 80: YYYY-MM-DD
-            Percentile 90: YYYY-MM-DD (latest date)
-            "
-            """
-        )
-
-        reasoning = await self.foresight.invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-
-        # Parse dates from percentile lines
         from datetime import datetime as dt
         date_pattern = r"(?:P|p)ercentile\s*(\d+)\s*:\s*(\d{4}-\d{2}-\d{2})"
-        date_matches = re.findall(date_pattern, reasoning)
 
-        if len(date_matches) < 2:
-            raise ValueError(f"Could not parse enough date percentiles from response")
+        all_date_sets = []  # list of dict[pct -> timestamp]
+        all_reasonings = []
+        for label, response in zip(task_labels, responses):
+            if response is None:
+                continue
+            date_matches = re.findall(date_pattern, response)
+            if len(date_matches) >= 4:
+                date_dict = {}
+                for pct_str, date_str in date_matches:
+                    try:
+                        parsed = dt.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                        date_dict[float(pct_str)] = parsed.timestamp()
+                    except ValueError:
+                        pass
+                if len(date_dict) >= 4:
+                    all_date_sets.append(date_dict)
+                    all_reasonings.append(f"### {label}\n{response[:500]}...")
+                    logger.info(f"  {label} -> {len(date_dict)} date percentiles")
+            else:
+                logger.warning(f"  {label}: only {len(date_matches)} date matches, skipping")
 
-        percentile_list = []
-        for pct_str, date_str in date_matches:
-            parsed_date = dt.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            percentile_list.append(
-                Percentile(
-                    percentile=float(pct_str) / 100.0,
-                    value=parsed_date.timestamp(),
-                )
+        if not all_date_sets:
+            # Fallback to single Foresight call
+            logger.warning("Date ensemble failed, falling back to single Foresight call")
+            prompt = DATE_PROMPT.format(
+                question_text=question.question_text,
+                background_info=question.background_info or "",
+                resolution_criteria=question.resolution_criteria or "",
+                fine_print=question.fine_print or "",
+                research=research,
+                today=today,
+                lower_bound_message=lower_bound_message,
+                upper_bound_message=upper_bound_message,
+                conditional_disclaimer=conditional_disclaimer,
             )
+            response = await self.foresight.invoke(prompt)
+            date_matches = re.findall(date_pattern, response)
+            if len(date_matches) < 2:
+                raise ValueError("Could not parse date percentiles even from fallback")
+            date_dict = {}
+            for pct_str, date_str in date_matches:
+                parsed = dt.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                date_dict[float(pct_str)] = parsed.timestamp()
+            all_date_sets.append(date_dict)
+            all_reasonings.append(f"### foresight-v3 (fallback)\n{response[:500]}...")
 
-        percentile_list.sort(key=lambda p: p.percentile)
+        # Aggregate: median timestamps per percentile
+        standard_pcts = [10, 20, 40, 60, 80, 90]
+        merged = {}
+        for pct in standard_pcts:
+            values = [ds[pct] for ds in all_date_sets if pct in ds]
+            if values:
+                merged[pct] = statistics.median(values)
+
+        if len(merged) < 2:
+            raise ValueError(f"Not enough date percentiles: {merged}")
+
+        percentile_list = [
+            Percentile(percentile=p / 100.0, value=v)
+            for p, v in sorted(merged.items())
+        ]
+
+        # Ensure strictly increasing
+        for i in range(len(percentile_list) - 1):
+            if percentile_list[i].value >= percentile_list[i + 1].value:
+                percentile_list[i + 1] = Percentile(
+                    percentile=percentile_list[i + 1].percentile,
+                    value=percentile_list[i].value + 86400,  # +1 day
+                )
+
         prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}")
+        combined_reasoning = (
+            f"## Ensemble Date Forecast ({len(all_date_sets)} models)\n\n"
+            + "\n\n".join(all_reasonings)
+        )
 
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        logger.info(f"Date ensemble for {question.page_url}: {len(all_date_sets)} models contributed")
+        return ReasonedPrediction(prediction_value=prediction, reasoning=combined_reasoning)
 
-    ##################################### CONDITIONAL QUESTIONS #####################################
+    # ======================== CONDITIONAL QUESTIONS ========================
 
     async def _run_forecast_on_conditional(
         self, question: ConditionalQuestion, research: str
@@ -642,7 +1116,7 @@ Text to extract from:
 You have previously forecasted the {question_type} Question to the value: {DataOrganizer.get_readable_prediction(reasoning.prediction_value)}
 """
 
-    ##################################### HELPERS #####################################
+    # ======================== HELPERS ========================
 
     def _create_upper_and_lower_bound_messages(
         self, question: NumericQuestion | DateQuestion
@@ -671,7 +1145,7 @@ You have previously forecasted the {question_type} Question to the value: {DataO
         return upper_msg, lower_msg
 
     def _get_conditional_disclaimer_if_necessary(self, question: MetaculusQuestion) -> str:
-        if question.conditional_type not in ["yes", "no"]:
+        if not hasattr(question, 'conditional_type') or question.conditional_type not in ["yes", "no"]:
             return ""
         return "As you are given a conditional question, only forecast the CHILD question given the parent question's resolution."
 
@@ -686,11 +1160,10 @@ if __name__ == "__main__":
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    # Suppress noisy loggers
     for noisy in ["LiteLLM", "openai.agents", "httpx", "httpcore"]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    parser = argparse.ArgumentParser(description="Run CassandraBot")
+    parser = argparse.ArgumentParser(description="Run CassandraBot v2")
     parser.add_argument(
         "--mode",
         type=str,
@@ -701,29 +1174,26 @@ if __name__ == "__main__":
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     # ============================================================
-    # Initialize Foresight v3 - purpose-built forecasting model
-    # Beat o3, Grok 4, and Claude Opus on live prediction markets
-    # Cost: ~$0.05 per question (5 runs) = ~$25-35 for full tournament
+    # Initialize ensemble
+    # Models are auto-detected from environment variables.
+    # Set LIGHTNINGROD_API_KEY for Foresight v3.
+    # Set OPENROUTER_API_KEY for all OpenRouter models.
+    # Set ASKNEWS_CLIENT_ID + ASKNEWS_SECRET for news research.
     # ============================================================
 
-    foresight = ForesightLlm(
-        temperature=0.3,
-        max_tokens=4000,
-        timeout=120,
-    )
+    foresight = ForesightLlm(temperature=0.3, max_tokens=4000, timeout=180)
 
     cassandra_bot = CassandraBot(
         foresight=foresight,
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=1,  # We do our own ensemble internally
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         llms={
-            # These are needed by the parent ForecastBot class
-            # but we override all the methods that use them
+            # Needed by parent ForecastBot class but we override all methods
             "default": "no_research",
             "summarizer": "no_research",
             "researcher": "no_research",
