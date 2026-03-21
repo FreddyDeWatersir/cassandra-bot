@@ -15,7 +15,8 @@ Models in ensemble:
   - OpenAI GPT-5.4 (frontier general)
   - Anthropic Claude Opus 4.6 (strongest complex reasoning)
   - Anthropic Claude Sonnet 4.6 (fast, strong)
-  - Google Gemini 3.1 Pro (excellent reasoning, great value)
+  - Google Gemini 3.1 Pro Preview (excellent reasoning, great value)
+  - DeepSeek R1 (strong open-source reasoning)
 """
 
 import argparse
@@ -560,11 +561,12 @@ class CassandraBot(ForecastBot):
             openrouter_key = os.getenv("OPENROUTER_API_KEY")
             if openrouter_key:
                 openrouter_models = [
-                    "openai/o3",                    # Strong reasoning
-                    "openai/gpt-5.4",               # Frontier general model
-                    "anthropic/claude-opus-4.6",     # Strongest complex reasoning
-                    "anthropic/claude-sonnet-4.6",   # Fast, strong, good value
-                    "google/gemini-3.1-pro",         # Excellent reasoning, great value
+                    "openai/o3",                         # Strong reasoning
+                    "openai/gpt-5.4",                    # Frontier general model
+                    "anthropic/claude-opus-4.6",         # Strongest complex reasoning
+                    "anthropic/claude-sonnet-4.6",       # Fast, strong, good value
+                    "google/gemini-3.1-pro-preview",     # Frontier reasoning, great value
+                    "deepseek/deepseek-r1",              # Strong open-source reasoning
                 ]
                 for model_name in openrouter_models:
                     try:
@@ -586,62 +588,46 @@ class CassandraBot(ForecastBot):
     async def run_research(self, question: MetaculusQuestion) -> str:
         """
         Multi-source research pipeline:
-        1. AskNews latest news search
-        2. AskNews historical/knowledge search
-        3. Foresight v3 reasoning fallback if no AskNews
+        1. AskNews via forecasting-tools AskNewsSearcher (works with Metaculus free tier)
+        2. Foresight v3 reasoning fallback if AskNews unavailable
         """
         async with self._concurrency_limiter:
             research_parts = []
 
-            # --- AskNews: try both latest and historical ---
+            research_prompt = clean_indents(
+                f"""
+                You are an assistant to a superforecaster.
+                The superforecaster will give you a question they intend to forecast on.
+                To be a great assistant, you generate a concise but detailed rundown of the
+                most relevant news, including if the question would resolve Yes or No based
+                on current information. You do not produce forecasts yourself.
+
+                Question:
+                {question.question_text}
+
+                This question's outcome will be determined by the specific criteria below:
+                {question.resolution_criteria}
+
+                {question.fine_print}
+                """
+            )
+
+            # --- AskNews via forecasting-tools wrapper (works with Metaculus free tier) ---
             asknews_client_id = os.getenv("ASKNEWS_CLIENT_ID")
             asknews_secret = os.getenv("ASKNEWS_SECRET")
             if asknews_client_id and asknews_secret:
                 try:
-                    from asknews_sdk import AsyncAskNewsSDK
-
-                    ask = AsyncAskNewsSDK(
-                        client_id=asknews_client_id,
-                        client_secret=asknews_secret,
-                        scopes=["chat", "news", "stories", "analytics"],
+                    searcher = AskNewsSearcher()
+                    research = await searcher.call_preconfigured_version(
+                        "asknews/news-search", research_prompt
                     )
-
-                    # Latest news
-                    try:
-                        latest = await ask.news.search_news(
-                            query=question.question_text,
-                            n_articles=5,
-                            return_type="both",
-                            strategy="latest news",
-                        )
-                        if latest.as_string:
-                            research_parts.append(
-                                f"=== LATEST NEWS ===\n{latest.as_string}"
-                            )
-                            logger.info(f"AskNews latest: got {len(latest.as_string)} chars")
-                    except Exception as e:
-                        logger.warning(f"AskNews latest search failed: {e}")
-
-                    # Historical / knowledge search (past 60 days archive)
-                    try:
-                        historical = await ask.news.search_news(
-                            query=question.question_text,
-                            n_articles=10,
-                            return_type="both",
-                            strategy="news knowledge",
-                        )
-                        if historical.as_string:
-                            research_parts.append(
-                                f"=== HISTORICAL NEWS & CONTEXT ===\n{historical.as_string}"
-                            )
-                            logger.info(f"AskNews historical: got {len(historical.as_string)} chars")
-                    except Exception as e:
-                        logger.warning(f"AskNews historical search failed: {e}")
-
-                except ImportError:
-                    logger.warning("asknews_sdk not installed, skipping AskNews")
+                    if research and len(research.strip()) > 50:
+                        research_parts.append(f"=== ASKNEWS RESEARCH ===\n{research}")
+                        logger.info(f"AskNews research: got {len(research)} chars")
+                    else:
+                        logger.warning("AskNews returned empty/short result")
                 except Exception as e:
-                    logger.warning(f"AskNews initialization failed: {e}")
+                    logger.warning(f"AskNews research failed: {e}")
             else:
                 logger.info("AskNews credentials not found, skipping AskNews research")
 
@@ -1193,11 +1179,14 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         llms={
-            # Needed by parent ForecastBot class but we override all methods
-            "default": "no_research",
-            "summarizer": "no_research",
-            "researcher": "no_research",
-            "parser": "no_research",
+            # The parent ForecastBot uses these for internal operations.
+            # We override run_research and all _run_forecast_on_* methods,
+            # but the parent still uses "summarizer" for report generation.
+            # Use a cheap OpenRouter model so it doesn't error.
+            "default": "openrouter/openai/gpt-4o-mini",
+            "summarizer": "openrouter/openai/gpt-4o-mini",
+            "researcher": "openrouter/openai/gpt-4o-mini",
+            "parser": "openrouter/openai/gpt-4o-mini",
         },
     )
 
