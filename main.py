@@ -2,7 +2,7 @@
 CassandraBot v2 - Multi-Model Ensemble Forecasting Bot
 
 Architecture:
-1. RESEARCH: AskNews (latest + historical) with Foresight v3 fallback
+1. RESEARCH: AskNews → Perplexity Sonar (live web search) → Foresight v3 fallback
 2. FORECAST: 6-model ensemble via OpenRouter + Lightning Rod direct API
    - Models run in parallel with diverse prompting strategies
    - Outside View / Inside View / Devil's Advocate perspectives
@@ -586,8 +586,9 @@ class CassandraBot(ForecastBot):
     async def run_research(self, question: MetaculusQuestion) -> str:
         """
         Multi-source research pipeline:
-        1. AskNews via forecasting-tools AskNewsSearcher (works with Metaculus free tier)
-        2. Foresight v3 reasoning fallback if AskNews unavailable
+        1. AskNews (if credentials available and working)
+        2. Perplexity Sonar via OpenRouter (live web search, works with OpenRouter credits)
+        3. Foresight v3 reasoning fallback
         """
         async with self._concurrency_limiter:
             research_parts = []
@@ -610,12 +611,8 @@ class CassandraBot(ForecastBot):
                 """
             )
 
-            # --- AskNews via forecasting-tools wrapper ---
-            # Supports either OAuth2 (ASKNEWS_CLIENT_ID + ASKNEWS_SECRET)
-            # or API key (ASKNEWS_API_KEY) — but NOT both simultaneously
-            has_oauth = bool(os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET"))
-            has_api_key = bool(os.getenv("ASKNEWS_API_KEY"))
-            if has_oauth or has_api_key:
+            # --- Tier 1: AskNews via API key ---
+            if os.getenv("ASKNEWS_API_KEY"):
                 try:
                     searcher = AskNewsSearcher()
                     research = await searcher.call_preconfigured_version(
@@ -628,12 +625,28 @@ class CassandraBot(ForecastBot):
                         logger.warning("AskNews returned empty/short result")
                 except Exception as e:
                     logger.warning(f"AskNews research failed: {e}")
-            else:
-                logger.info("AskNews credentials not found, skipping AskNews research")
 
-            # --- Fallback: if no AskNews results, use Foresight for basic research ---
+            # --- Tier 2: Perplexity Sonar via OpenRouter (live web search) ---
+            if not research_parts and os.getenv("OPENROUTER_API_KEY"):
+                try:
+                    perplexity = OpenRouterLlm(
+                        model="perplexity/sonar",
+                        temperature=0.2,
+                        max_tokens=4000,
+                        timeout=120,
+                    )
+                    perplexity_research = await perplexity.invoke(research_prompt)
+                    if perplexity_research and len(perplexity_research.strip()) > 50:
+                        research_parts.append(f"=== WEB RESEARCH (Perplexity) ===\n{perplexity_research}")
+                        logger.info(f"Perplexity research: got {len(perplexity_research)} chars")
+                    else:
+                        logger.warning("Perplexity returned empty/short result")
+                except Exception as e:
+                    logger.warning(f"Perplexity research failed: {e}")
+
+            # --- Tier 3: Foresight v3 reasoning fallback (no web search, but good reasoning) ---
             if not research_parts:
-                logger.info("No AskNews results, falling back to Foresight v3 for research")
+                logger.info("No web research available, falling back to Foresight v3")
                 fallback_prompt = clean_indents(
                     f"""
                     You are a research assistant to a superforecaster.
@@ -1164,7 +1177,7 @@ if __name__ == "__main__":
     # Models are auto-detected from environment variables.
     # Set LIGHTNINGROD_API_KEY for Foresight v3.
     # Set OPENROUTER_API_KEY for all OpenRouter models.
-    # Set ASKNEWS_CLIENT_ID + ASKNEWS_SECRET for news research.
+    # Set ASKNEWS_API_KEY for news research.
     # ============================================================
 
     foresight = ForesightLlm(temperature=0.3, max_tokens=4000, timeout=180)
