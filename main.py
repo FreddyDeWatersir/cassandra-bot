@@ -2,7 +2,7 @@
 CassandraBot v2 - Multi-Model Ensemble Forecasting Bot
 
 Architecture:
-1. RESEARCH: AskNews → Perplexity Sonar (live web search) → Foresight v3 fallback
+1. RESEARCH: AskNews (live news search) → GPT-4o-mini fallback → Foresight v3 fallback
 2. FORECAST: 6-model ensemble via OpenRouter + Lightning Rod direct API
    - Models run in parallel with diverse prompting strategies
    - Outside View / Inside View / Devil's Advocate perspectives
@@ -586,8 +586,8 @@ class CassandraBot(ForecastBot):
     async def run_research(self, question: MetaculusQuestion) -> str:
         """
         Multi-source research pipeline:
-        1. AskNews (if credentials available and working)
-        2. Perplexity Sonar via OpenRouter (live web search, works with OpenRouter credits)
+        1. AskNews (live news search via API key)
+        2. GPT-4o-mini via OpenRouter (LLM research fallback)
         3. Foresight v3 reasoning fallback
         """
         async with self._concurrency_limiter:
@@ -626,23 +626,23 @@ class CassandraBot(ForecastBot):
                 except Exception as e:
                     logger.warning(f"AskNews research failed: {e}")
 
-            # --- Tier 2: Perplexity Sonar via OpenRouter (live web search) ---
+            # --- Tier 2: GPT-4o-mini research via OpenRouter (if AskNews fails) ---
             if not research_parts and os.getenv("OPENROUTER_API_KEY"):
                 try:
-                    perplexity = OpenRouterLlm(
-                        model="perplexity/sonar",
+                    researcher = OpenRouterLlm(
+                        model="openai/gpt-4o-mini",
                         temperature=0.2,
                         max_tokens=4000,
                         timeout=120,
                     )
-                    perplexity_research = await perplexity.invoke(research_prompt)
-                    if perplexity_research and len(perplexity_research.strip()) > 50:
-                        research_parts.append(f"=== WEB RESEARCH (Perplexity) ===\n{perplexity_research}")
-                        logger.info(f"Perplexity research: got {len(perplexity_research)} chars")
+                    researcher_result = await researcher.invoke(research_prompt)
+                    if researcher_result and len(researcher_result.strip()) > 50:
+                        research_parts.append(f"=== LLM RESEARCH ===\n{researcher_result}")
+                        logger.info(f"GPT-4o-mini research: got {len(researcher_result)} chars")
                     else:
-                        logger.warning("Perplexity returned empty/short result")
+                        logger.warning("GPT-4o-mini research returned empty/short result")
                 except Exception as e:
-                    logger.warning(f"Perplexity research failed: {e}")
+                    logger.warning(f"GPT-4o-mini research failed: {e}")
 
             # --- Tier 3: Foresight v3 reasoning fallback (no web search, but good reasoning) ---
             if not research_parts:
