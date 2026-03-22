@@ -15,7 +15,7 @@ Models in ensemble:
   - OpenAI GPT-5.4 (frontier general)
   - Anthropic Claude Opus 4.6 (strongest complex reasoning)
   - Anthropic Claude Sonnet 4.6 (fast, strong)
-  - Google Gemini 3.1 Pro Preview (excellent reasoning, great value)
+  - OpenAI o4-mini (fast reasoning, proven in tournament)
   - DeepSeek R1 (strong open-source reasoning)
 """
 
@@ -565,7 +565,7 @@ class CassandraBot(ForecastBot):
                     "openai/gpt-5.4",                    # Frontier general model
                     "anthropic/claude-opus-4.6",         # Strongest complex reasoning
                     "anthropic/claude-sonnet-4.6",       # Fast, strong, good value
-                    "google/gemini-3.1-pro-preview",     # Frontier reasoning, great value
+                    "openai/o4-mini",                    # Fast reasoning, proven in tournament
                     "deepseek/deepseek-r1",              # Strong open-source reasoning
                 ]
                 for model_name in openrouter_models:
@@ -619,7 +619,7 @@ class CassandraBot(ForecastBot):
                 try:
                     searcher = AskNewsSearcher()
                     research = await searcher.call_preconfigured_version(
-                        "asknews/news-search", research_prompt
+                        "asknews/news-summaries", research_prompt
                     )
                     if research and len(research.strip()) > 50:
                         research_parts.append(f"=== ASKNEWS RESEARCH ===\n{research}")
