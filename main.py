@@ -16,7 +16,6 @@ Models in ensemble:
   - Anthropic Claude Opus 4.6 (strongest complex reasoning)
   - Anthropic Claude Sonnet 4.6 (fast, strong)
   - OpenAI o4-mini (fast reasoning, proven in tournament)
-  - DeepSeek R1 (strong open-source reasoning)
 """
 
 import argparse
@@ -566,7 +565,6 @@ class CassandraBot(ForecastBot):
                     "anthropic/claude-opus-4.6",         # Strongest complex reasoning
                     "anthropic/claude-sonnet-4.6",       # Fast, strong, good value
                     "openai/o4-mini",                    # Fast reasoning, proven in tournament
-                    "deepseek/deepseek-r1",              # Strong open-source reasoning
                 ]
                 for model_name in openrouter_models:
                     try:
@@ -612,10 +610,12 @@ class CassandraBot(ForecastBot):
                 """
             )
 
-            # --- AskNews via forecasting-tools wrapper (works with Metaculus free tier) ---
-            asknews_client_id = os.getenv("ASKNEWS_CLIENT_ID")
-            asknews_secret = os.getenv("ASKNEWS_SECRET")
-            if asknews_client_id and asknews_secret:
+            # --- AskNews via forecasting-tools wrapper ---
+            # Supports either OAuth2 (ASKNEWS_CLIENT_ID + ASKNEWS_SECRET)
+            # or API key (ASKNEWS_API_KEY) — but NOT both simultaneously
+            has_oauth = bool(os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET"))
+            has_api_key = bool(os.getenv("ASKNEWS_API_KEY"))
+            if has_oauth or has_api_key:
                 try:
                     searcher = AskNewsSearcher()
                     research = await searcher.call_preconfigured_version(
