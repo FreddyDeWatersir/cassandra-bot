@@ -1,0 +1,62 @@
+name: Validate Bot Performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      num_questions:
+        description: 'Number of benchmark questions to evaluate'
+        required: false
+        default: '20'
+        type: string
+      sweep:
+        description: 'Sweep extremization factors'
+        required: false
+        default: 'true'
+        type: boolean
+
+# Run weekly on Sundays at 6am UTC to track performance over time
+# Uncomment the schedule below once you've confirmed it works via manual trigger
+# schedule:
+#   - cron: '0 6 * * 0'
+
+jobs:
+  validate_job:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+      LIGHTNINGROD_API_KEY: ${{ secrets.LIGHTNINGROD_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'poetry'
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Run validation
+        run: |
+          SWEEP_FLAG=""
+          if [ "${{ inputs.sweep }}" = "true" ]; then
+            SWEEP_FLAG="--sweep"
+          fi
+          poetry run python validate.py \
+            --num_questions ${{ inputs.num_questions || '20' }} \
+            $SWEEP_FLAG
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-results-${{ github.run_number }}
+          path: validate_results.json
+          retention-days: 90
