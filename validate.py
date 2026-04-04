@@ -65,15 +65,87 @@ async def run_validation(num_questions: int = 20, sweep: bool = False):
 
     logger.info(f"Fetching {num_questions} benchmark questions from Metaculus...")
 
+    questions = []
+
+    # Attempt 1: Use the built-in benchmarker (may fail if not enough questions pass filters)
     try:
         questions = MetaculusApi.get_benchmark_questions(
             num_of_questions_to_return=num_questions,
+            error_if_not_enough_questions=False,
         )
+        logger.info(f"Benchmarker returned {len(questions)} questions")
     except Exception as e:
-        logger.error(f"Failed to fetch benchmark questions: {e}")
-        logger.info("Falling back to manual question fetching...")
-        # Fallback: fetch from a known resolved tournament or question set
-        raise
+        logger.warning(f"Benchmarker failed: {e}")
+
+    # Attempt 2: If benchmarker returned too few, fetch resolved questions directly
+    if len(questions) < 5:
+        logger.info("Not enough benchmark questions, fetching resolved questions from Metaculus API...")
+        try:
+            import requests
+            # Fetch recently resolved binary questions with enough forecasters
+            api_url = "https://www.metaculus.com/api/questions/"
+            headers = {}
+            token = os.getenv("METACULUS_TOKEN")
+            if token:
+                headers["Authorization"] = f"Token {token}"
+
+            params = {
+                "type": "forecast",
+                "forecast_type": "binary",
+                "status": "resolved",
+                "order_by": "-resolve_time",
+                "limit": num_questions,
+                "format": "json",
+            }
+            resp = requests.get(api_url, headers=headers, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            results_list = data.get("results", [])
+            logger.info(f"Metaculus API returned {len(results_list)} resolved questions")
+
+            client = MetaculusClient()
+            for item in results_list[:num_questions]:
+                try:
+                    q_id = item.get("id")
+                    if q_id:
+                        url = f"https://www.metaculus.com/questions/{q_id}/"
+                        q = client.get_question_by_url(url)
+                        if isinstance(q, BinaryQuestion) and q.resolution is not None:
+                            questions.append(q)
+                            logger.info(f"  Loaded resolved question {q_id}")
+                except Exception as eq:
+                    logger.debug(f"Skipping question {item.get('id', '?')}: {eq}")
+                    continue
+
+            logger.info(f"Successfully loaded {len(questions)} resolved binary questions")
+        except Exception as e2:
+            logger.warning(f"API fallback also failed: {e2}")
+
+    if not questions:
+        logger.info("API fallback returned nothing, using hardcoded resolved questions...")
+        # Known resolved binary questions from past tournaments/MiniBench
+        # Update this list periodically with recently resolved questions
+        FALLBACK_URLS = [
+            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
+            "https://www.metaculus.com/questions/3479/will-the-world-population-decline-by-at-least-10-by-2100/",
+            "https://www.metaculus.com/questions/11276/russia-ukraine-ceasefire-before-2024/",
+            "https://www.metaculus.com/questions/6525/us-inflation-rate-2023/",
+            "https://www.metaculus.com/questions/9939/gpt-5-release-date/",
+        ]
+        client = MetaculusClient()
+        for url in FALLBACK_URLS:
+            try:
+                q = client.get_question_by_url(url)
+                if isinstance(q, BinaryQuestion) and q.resolution is not None:
+                    questions.append(q)
+                    logger.info(f"  Loaded fallback question: {url}")
+            except Exception as eq:
+                logger.debug(f"  Skipping fallback {url}: {eq}")
+
+    if not questions:
+        logger.error("Could not fetch any benchmark questions. Exiting.")
+        sys.exit(1)
 
     # Filter to binary questions only (the benchmarker currently returns binary)
     binary_questions = [q for q in questions if isinstance(q, BinaryQuestion)]
