@@ -6,8 +6,9 @@ accuracy (Brier score) and compare against the community prediction.
 
 Usage:
   poetry run python validate.py                    # Default: 20 questions
-  poetry run python validate.py --num_questions 50 # More questions (costs more)
+  poetry run python validate.py --num_questions 30 # More questions (costs more)
   poetry run python validate.py --sweep            # Sweep extremization factors
+  poetry run python validate.py --question_urls_from validate_results_baseline.json
 
 Output:
   - Brier scores for your bot vs community prediction
@@ -28,21 +29,62 @@ from datetime import datetime, timezone
 import dotenv
 dotenv.load_dotenv()
 
-from forecasting_tools import (
-    MetaculusApi,
-    MetaculusClient,
-    BinaryQuestion,
-)
+from forecasting_tools import MetaculusClient, BinaryQuestion
+from forecasting_tools.data_models.questions import QuestionState
+from forecasting_tools.helpers.metaculus_client import ApiFilter
 
 # Import the bot (same main.py)
 from main import CassandraBot, ForesightLlm, extremize
 
 logger = logging.getLogger(__name__)
 
+_GROUND_TRUTH_PATH = os.path.join(os.path.dirname(__file__), "validation_ground_truth.json")
+
+
+def load_ground_truth_overrides() -> dict[int, float]:
+    """Post ID -> 0.0/1.0 for resolved questions when API omits resolution."""
+    if not os.path.isfile(_GROUND_TRUTH_PATH):
+        return {}
+    with open(_GROUND_TRUTH_PATH, encoding="utf-8") as f:
+        raw = json.load(f)
+    return {int(k): float(v) for k, v in raw.items()}
+
 
 def brier_score(predicted: float, actual: float) -> float:
     """Brier score: lower is better. Range [0, 2]."""
     return (predicted - actual) ** 2
+
+
+def get_binary_actual(
+    question: BinaryQuestion, ground_truth: dict[int, float] | None = None
+) -> float | None:
+    """Map a resolved binary question to 1.0 (Yes) or 0.0 (No)."""
+    if ground_truth and question.id_of_post in ground_truth:
+        return ground_truth[question.id_of_post]
+    if getattr(question, "resolution", None) is not None:
+        return float(question.resolution)
+    br = question.binary_resolution
+    if br is True:
+        return 1.0
+    if br is False:
+        return 0.0
+    rs = question.resolution_string
+    if rs == "yes":
+        return 1.0
+    if rs == "no":
+        return 0.0
+    return None
+
+
+def question_is_usable_for_validation(
+    question: BinaryQuestion, ground_truth: dict[int, float] | None = None
+) -> bool:
+    """Resolved binary with a known yes/no outcome."""
+    if ground_truth and question.id_of_post in ground_truth:
+        return True
+    if question.state != QuestionState.RESOLVED:
+        return False
+    return get_binary_actual(question, ground_truth) is not None
 
 
 def log_score(predicted: float, actual: float) -> float:
@@ -54,7 +96,60 @@ def log_score(predicted: float, actual: float) -> float:
         return math.log(1.0 - predicted)
 
 
-async def run_validation(num_questions: int = 20, sweep: bool = False):
+async def fetch_resolved_binary_questions(
+    num_questions: int, ground_truth: dict[int, float]
+) -> list[BinaryQuestion]:
+    """Sample resolved binary questions via Metaculus API filter."""
+    client = MetaculusClient()
+    api_filter = ApiFilter(
+        allowed_statuses=["resolved"],
+        allowed_types=["binary"],
+        num_forecasters_gte=10,
+        includes_bots_in_aggregates=False,
+        group_question_mode="exclude",
+    )
+    raw = await client.get_questions_matching_filter(
+        api_filter,
+        num_questions=num_questions,
+        randomly_sample=True,
+        error_if_question_target_missed=False,
+    )
+    questions = [
+        q
+        for q in raw
+        if isinstance(q, BinaryQuestion)
+        and question_is_usable_for_validation(q, ground_truth)
+    ]
+    logger.info(
+        f"Resolved filter returned {len(questions)} usable questions "
+        f"(from {len(raw)} sampled)"
+    )
+    return questions
+
+
+def load_questions_from_results_file(path: str) -> list[BinaryQuestion]:
+    """Load the same question URLs from a prior validate_results JSON file."""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    urls = [r["url"] for r in data.get("results", []) if r.get("url")]
+    if not urls:
+        raise ValueError(f"No question URLs found in {path}")
+    ground_truth = load_ground_truth_overrides()
+    client = MetaculusClient()
+    questions = []
+    for url in urls:
+        q = client.get_question_by_url(url)
+        if isinstance(q, BinaryQuestion) and question_is_usable_for_validation(q, ground_truth):
+            questions.append(q)
+    logger.info(f"Loaded {len(questions)} questions from {path} ({len(urls)} URLs)")
+    return questions
+
+
+async def run_validation(
+    num_questions: int = 20,
+    sweep: bool = False,
+    question_urls_from: str | None = None,
+):
     """
     Main validation loop:
     1. Fetch resolved binary benchmark questions from Metaculus
@@ -63,85 +158,35 @@ async def run_validation(num_questions: int = 20, sweep: bool = False):
     4. Compare against community prediction baseline
     """
 
-    logger.info(f"Fetching {num_questions} benchmark questions from Metaculus...")
-
     questions = []
+    ground_truth = load_ground_truth_overrides()
 
-    # Attempt 1: Use the built-in benchmarker (may fail if not enough questions pass filters)
-    try:
-        questions = MetaculusApi.get_benchmark_questions(
-            num_of_questions_to_return=num_questions,
-            error_if_not_enough_questions=False,
-        )
-        logger.info(f"Benchmarker returned {len(questions)} questions")
-    except Exception as e:
-        logger.warning(f"Benchmarker failed: {e}")
-
-    # Attempt 2: If benchmarker returned too few, fetch resolved questions directly
-    if len(questions) < 5:
-        logger.info("Not enough benchmark questions, fetching resolved questions from Metaculus API...")
+    if question_urls_from:
+        logger.info(f"Using fixed question set from {question_urls_from}")
+        questions = load_questions_from_results_file(question_urls_from)
+    else:
+        logger.info(f"Fetching {num_questions} resolved binary questions from Metaculus...")
         try:
-            import requests
-            # Fetch recently resolved binary questions with enough forecasters
-            api_url = "https://www.metaculus.com/api/questions/"
-            headers = {}
-            token = os.getenv("METACULUS_TOKEN")
-            if token:
-                headers["Authorization"] = f"Token {token}"
+            questions = await fetch_resolved_binary_questions(num_questions, ground_truth)
+        except Exception as e:
+            logger.warning(f"Resolved question fetch failed: {e}")
 
-            params = {
-                "type": "forecast",
-                "forecast_type": "binary",
-                "status": "resolved",
-                "order_by": "-resolve_time",
-                "limit": num_questions,
-                "format": "json",
-            }
-            resp = requests.get(api_url, headers=headers, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-
-            results_list = data.get("results", [])
-            logger.info(f"Metaculus API returned {len(results_list)} resolved questions")
-
+        if not questions and ground_truth:
+            logger.info(
+                f"Using validation_ground_truth.json ({len(ground_truth)} known outcomes)..."
+            )
             client = MetaculusClient()
-            for item in results_list[:num_questions]:
+            for post_id in list(ground_truth.keys())[:num_questions]:
+                url = f"https://www.metaculus.com/questions/{post_id}/"
                 try:
-                    q_id = item.get("id")
-                    if q_id:
-                        url = f"https://www.metaculus.com/questions/{q_id}/"
-                        q = client.get_question_by_url(url)
-                        if isinstance(q, BinaryQuestion) and q.resolution is not None:
-                            questions.append(q)
-                            logger.info(f"  Loaded resolved question {q_id}")
+                    q = client.get_question_by_url(url)
+                    if isinstance(q, BinaryQuestion) and question_is_usable_for_validation(
+                        q, ground_truth
+                    ):
+                        questions.append(q)
+                        logger.info(f"  Loaded ground-truth question: {url}")
                 except Exception as eq:
-                    logger.debug(f"Skipping question {item.get('id', '?')}: {eq}")
-                    continue
-
-            logger.info(f"Successfully loaded {len(questions)} resolved binary questions")
-        except Exception as e2:
-            logger.warning(f"API fallback also failed: {e2}")
-
-    if not questions:
-        logger.info("API fallback returned nothing, using hardcoded resolved questions...")
-        # Known resolved binary questions from past tournaments/MiniBench
-        # Update this list periodically with recently resolved questions
-        FALLBACK_URLS = [
-            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
-            "https://www.metaculus.com/questions/3479/will-the-world-population-decline-by-at-least-10-by-2100/",
-            "https://www.metaculus.com/questions/11276/russia-ukraine-ceasefire-before-2024/",
-            "https://www.metaculus.com/questions/6525/us-inflation-rate-2023/",
-            "https://www.metaculus.com/questions/9939/gpt-5-release-date/",
-        ]
-        client = MetaculusClient()
-        for url in FALLBACK_URLS:
-            try:
-                q = client.get_question_by_url(url)
-                if isinstance(q, BinaryQuestion) and q.resolution is not None:
-                    questions.append(q)
-                    logger.info(f"  Loaded fallback question: {url}")
-            except Exception as eq:
-                logger.debug(f"  Skipping fallback {url}: {eq}")
+                    logger.debug(f"  Skipping ground-truth {url}: {eq}")
 
     if not questions:
         logger.error("Could not fetch any benchmark questions. Exiting.")
@@ -180,14 +225,10 @@ async def run_validation(num_questions: int = 20, sweep: bool = False):
         logger.info(f"Question {i+1}/{len(binary_questions)}: {question.question_text[:80]}...")
         logger.info(f"URL: {question.page_url}")
 
-        # Get the resolution (actual outcome)
-        resolution = question.resolution
-        if resolution is None:
-            logger.warning(f"  Skipping - no resolution available")
+        actual = get_binary_actual(question, ground_truth)
+        if actual is None:
+            logger.warning("  Skipping - no yes/no resolution available")
             continue
-
-        # resolution is typically 1.0 (Yes) or 0.0 (No)
-        actual = float(resolution)
         logger.info(f"  Actual resolution: {actual}")
 
         # Get community prediction if available
@@ -369,9 +410,16 @@ if __name__ == "__main__":
         "--sweep", action="store_true",
         help="Sweep extremization factors to find optimal value"
     )
+    parser.add_argument(
+        "--question_urls_from",
+        type=str,
+        default=None,
+        help="Path to a prior validate_results JSON; reuse the same question URLs for A/B runs",
+    )
     args = parser.parse_args()
 
     asyncio.run(run_validation(
         num_questions=args.num_questions,
         sweep=args.sweep,
+        question_urls_from=args.question_urls_from,
     ))

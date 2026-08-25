@@ -6,7 +6,7 @@ Architecture:
 2. FORECAST: 6-model ensemble via OpenRouter + Lightning Rod direct API
    - Models run in parallel with diverse prompting strategies
    - Outside View / Inside View / Devil's Advocate perspectives
-3. AGGREGATE: Median (binary/MC) or mixture (numeric) + extremization
+3. AGGREGATE: Log-odds mean (binary) / median (MC/numeric) + horizon-aware extremization
 4. SUBMIT: via forecasting-tools to Metaculus
 
 Models in ensemble:
@@ -21,6 +21,7 @@ Models in ensemble:
 import argparse
 import asyncio
 import logging
+import math
 import os
 import re
 import statistics
@@ -82,11 +83,12 @@ class ForesightLlm:
             timeout=timeout,
         )
 
-    def _call_sync(self, prompt: str) -> str:
+    def _call_sync(self, prompt: str, temperature: float | None = None) -> str:
+        temp = self.temperature if temperature is None else temperature
         response = self.client.chat.completions.create(
             model="LightningRodLabs/foresight-v3",
             messages=[{"role": "user", "content": prompt}],
-            temperature=self.temperature,
+            temperature=temp,
             max_tokens=self.max_tokens,
         )
         content = response.choices[0].message.content
@@ -94,10 +96,10 @@ class ForesightLlm:
             raise ValueError("Empty response from Foresight v3")
         return content
 
-    async def invoke(self, prompt: str) -> str:
+    async def invoke(self, prompt: str, temperature: float | None = None) -> str:
         for attempt in range(3):
             try:
-                result = await asyncio.to_thread(self._call_sync, prompt)
+                result = await asyncio.to_thread(self._call_sync, prompt, temperature)
                 return result
             except Exception as e:
                 logger.warning(f"Foresight API attempt {attempt + 1} failed: {e}")
@@ -123,11 +125,12 @@ class OpenRouterLlm:
             timeout=timeout,
         )
 
-    def _call_sync(self, prompt: str) -> str:
+    def _call_sync(self, prompt: str, temperature: float | None = None) -> str:
+        temp = self.temperature if temperature is None else temperature
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=self.temperature,
+            temperature=temp,
             max_tokens=self.max_tokens,
         )
         content = response.choices[0].message.content
@@ -135,10 +138,10 @@ class OpenRouterLlm:
             raise ValueError(f"Empty response from {self.model}")
         return content
 
-    async def invoke(self, prompt: str) -> str:
+    async def invoke(self, prompt: str, temperature: float | None = None) -> str:
         for attempt in range(3):
             try:
-                result = await asyncio.to_thread(self._call_sync, prompt)
+                result = await asyncio.to_thread(self._call_sync, prompt, temperature)
                 return result
             except Exception as e:
                 logger.warning(f"{self.name} attempt {attempt + 1} failed: {e}")
@@ -276,6 +279,29 @@ def extremize(prob: float, factor: float = 1.4) -> float:
     return max(0.01, min(0.99, result))
 
 
+def aggregate_logits(probs: list[float]) -> float:
+    """Mean of log-odds across ensemble members, mapped back to probability."""
+    clipped = [min(0.999, max(0.001, p)) for p in probs]
+    logits = [math.log(p / (1 - p)) for p in clipped]
+    mean_logit = sum(logits) / len(logits)
+    return 1.0 / (1.0 + math.exp(-mean_logit))
+
+
+def horizon_scaled_factor(base_factor: float, days_to_resolution: float | None) -> float:
+    """Weaken extremization for long-horizon questions where uncertainty is genuine."""
+    if days_to_resolution is None:
+        return base_factor
+    if days_to_resolution <= 30:
+        return base_factor
+    if days_to_resolution >= 365:
+        return 1.0 + (base_factor - 1.0) * 0.25
+    frac = (365 - days_to_resolution) / (365 - 30)
+    return 1.0 + (base_factor - 1.0) * (0.25 + 0.75 * frac)
+
+
+PERSPECTIVE_TEMPS = {"outside": 0.2, "inside": 0.4, "advocate": 0.7}
+
+
 # ============================================================
 # PROMPT TEMPLATES
 # ============================================================
@@ -381,7 +407,7 @@ The last thing you write is your final answer as: "Probability: ZZ%", 0-100
 """
 
 
-MC_PROMPT = """You are a professional forecaster interviewing for a job.
+_MC_PROMPT_HEADER = """You are a professional forecaster interviewing for a job.
 
 Your interview question is:
 {question_text}
@@ -400,16 +426,17 @@ Your research assistant says:
 
 Today is {today}.
 
-{view_instruction}
-
 {conditional_disclaimer}
+"""
 
-Before answering you write:
-(a) The time left until the outcome to the question is known.
-(b) The status quo outcome if nothing changed.
-(c) A description of a scenario that results in an unexpected outcome.
+MC_OUTSIDE_VIEW = _MC_PROMPT_HEADER + """
+Use the OUTSIDE VIEW methodology:
+(a) What is the base rate for each option in similar historical situations?
+(b) How much time is left until resolution?
+(c) What is the status quo outcome if nothing changed? Weight this heavily.
+(d) Adjust from base rates only if you have strong specific evidence.
 
-You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
+Good forecasters anchor on base rates and leave moderate probability on non-status-quo options.
 
 The last thing you write is your final probabilities for the N options in this order {options} as:
 Option_A: Probability_A%
@@ -418,8 +445,39 @@ Option_B: Probability_B%
 Option_N: Probability_N%
 """
 
+MC_INSIDE_VIEW = _MC_PROMPT_HEADER + """
+Use the INSIDE VIEW methodology:
+(a) How much time remains until resolution?
+(b) What specific causal mechanisms favor each option?
+(c) What is the current trajectory and momentum of relevant factors?
+(d) Map concrete steps needed for each outcome and assess their likelihood.
 
-NUMERIC_PROMPT = """You are a professional forecaster interviewing for a job.
+Reason through the specific causal chain for each option.
+
+The last thing you write is your final probabilities for the N options in this order {options} as:
+Option_A: Probability_A%
+Option_B: Probability_B%
+...
+Option_N: Probability_N%
+"""
+
+MC_DEVILS_ADVOCATE = _MC_PROMPT_HEADER + """
+Use the DEVIL'S ADVOCATE methodology:
+(a) How much time remains until resolution?
+(b) What is the consensus distribution across options? State it clearly.
+(c) Argue AGAINST the consensus. Which options are underweighted?
+(d) What unexpected scenarios could flip the leading option?
+
+Consider tail risks and contrarian scenarios seriously before finalizing.
+
+The last thing you write is your final probabilities for the N options in this order {options} as:
+Option_A: Probability_A%
+Option_B: Probability_B%
+...
+Option_N: Probability_N%
+"""
+
+_NUMERIC_PROMPT_HEADER = """You are a professional forecaster interviewing for a job.
 
 Your interview question is:
 {question_text}
@@ -441,24 +499,22 @@ Today is {today}.
 {lower_bound_message}
 {upper_bound_message}
 
-{view_instruction}
-
 {conditional_disclaimer}
 
 Formatting Instructions:
 - Please notice the units requested and give your answer in these units.
 - Never use scientific notation.
 - Always start with a smaller number and then increase from there.
+"""
 
-Before answering you write:
-(a) The time left until the outcome to the question is known.
-(b) The outcome if nothing changed.
-(c) The outcome if the current trend continued.
-(d) The expectations of experts and markets.
-(e) A brief description of an unexpected scenario that results in a low outcome.
-(f) A brief description of an unexpected scenario that results in a high outcome.
+NUMERIC_OUTSIDE_VIEW = _NUMERIC_PROMPT_HEADER + """
+Use the OUTSIDE VIEW methodology:
+(a) What is the historical reference class and typical range for this quantity?
+(b) How much time is left until resolution?
+(c) What is the status quo / base-rate central estimate?
+(d) Adjust only modestly from the reference class for specific evidence.
 
-You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+Set a wide 90/10 interval anchored on base rates and historical dispersion.
 
 The last thing you write is your final answer as:
 "
@@ -471,7 +527,47 @@ Percentile 90: XX (highest number value)
 "
 """
 
-DATE_PROMPT = """You are a professional forecaster interviewing for a job.
+NUMERIC_INSIDE_VIEW = _NUMERIC_PROMPT_HEADER + """
+Use the INSIDE VIEW methodology:
+(a) How much time remains until resolution?
+(b) What is the current level and recent trend of the quantity?
+(c) What causal mechanisms would push the outcome up vs down?
+(d) What do experts and markets currently expect?
+
+Reason through specific drivers; set percentiles reflecting the current trajectory.
+
+The last thing you write is your final answer as:
+"
+Percentile 10: XX (lowest number value)
+Percentile 20: XX
+Percentile 40: XX
+Percentile 60: XX
+Percentile 80: XX
+Percentile 90: XX (highest number value)
+"
+"""
+
+NUMERIC_DEVILS_ADVOCATE = _NUMERIC_PROMPT_HEADER + """
+Use the DEVIL'S ADVOCATE methodology:
+(a) How much time remains until resolution?
+(b) What is the obvious/consensus range? State it clearly.
+(c) Argue AGAINST the consensus. What tail scenarios produce very low or very high outcomes?
+(d) What are forecasters most likely to overlook?
+
+Widen the 90/10 interval to reflect contrarian upside and downside risks.
+
+The last thing you write is your final answer as:
+"
+Percentile 10: XX (lowest number value)
+Percentile 20: XX
+Percentile 40: XX
+Percentile 60: XX
+Percentile 80: XX
+Percentile 90: XX (highest number value)
+"
+"""
+
+_DATE_PROMPT_HEADER = """You are a professional forecaster interviewing for a job.
 
 Your interview question is:
 {question_text}
@@ -496,15 +592,16 @@ Today is {today}.
 Formatting Instructions:
 - This is a date question. Answer in YYYY-MM-DD format.
 - Always start with an earlier date at percentile 10 and increase chronologically.
+"""
 
-Before answering you write:
-(a) The time left until the outcome to the question is known.
-(b) The outcome if nothing changed.
-(c) The outcome if the current trend continued.
-(d) A brief description of an unexpected scenario that results in an early outcome.
-(e) A brief description of an unexpected scenario that results in a late outcome.
+DATE_OUTSIDE_VIEW = _DATE_PROMPT_HEADER + """
+Use the OUTSIDE VIEW methodology:
+(a) What is the base rate timing for similar events in history?
+(b) How much time is left until resolution?
+(c) What is the status quo timeline if nothing accelerates?
+(d) Adjust only modestly from historical reference timelines.
 
-You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals.
+Set a wide 90/10 date interval anchored on base rates.
 
 The last thing you write is your final answer as:
 "
@@ -517,13 +614,45 @@ Percentile 90: YYYY-MM-DD (latest date)
 "
 """
 
+DATE_INSIDE_VIEW = _DATE_PROMPT_HEADER + """
+Use the INSIDE VIEW methodology:
+(a) How much time remains until resolution?
+(b) What is the current pace of progress toward the event?
+(c) What specific steps remain and how long do they typically take?
+(d) What recent developments shift the timeline earlier or later?
 
-# View instructions for prompt diversity on non-binary question types
-VIEW_INSTRUCTIONS = {
-    "outside": "Use the OUTSIDE VIEW: anchor on base rates and historical reference classes. What usually happens in situations like this? Adjust only modestly from the base rate.",
-    "inside": "Use the INSIDE VIEW: reason through the specific causal mechanisms and current evidence. What does the trajectory of current events suggest?",
-    "advocate": "Play DEVIL'S ADVOCATE: consider what the consensus might get wrong. What tail risks or overlooked factors could shift the outcome?",
-}
+Reason through the causal chain for when the event will occur.
+
+The last thing you write is your final answer as:
+"
+Percentile 10: YYYY-MM-DD (earliest date)
+Percentile 20: YYYY-MM-DD
+Percentile 40: YYYY-MM-DD
+Percentile 60: YYYY-MM-DD
+Percentile 80: YYYY-MM-DD
+Percentile 90: YYYY-MM-DD (latest date)
+"
+"""
+
+DATE_DEVILS_ADVOCATE = _DATE_PROMPT_HEADER + """
+Use the DEVIL'S ADVOCATE methodology:
+(a) How much time remains until resolution?
+(b) What is the consensus expected date range? State it clearly.
+(c) Argue AGAINST the consensus. What could cause a much earlier or much later outcome?
+(d) What tail risks are underweighted?
+
+Widen the 90/10 date interval for contrarian early/late scenarios.
+
+The last thing you write is your final answer as:
+"
+Percentile 10: YYYY-MM-DD (earliest date)
+Percentile 20: YYYY-MM-DD
+Percentile 40: YYYY-MM-DD
+Percentile 60: YYYY-MM-DD
+Percentile 80: YYYY-MM-DD
+Percentile 90: YYYY-MM-DD (latest date)
+"
+"""
 
 
 # ============================================================
@@ -672,14 +801,35 @@ class CassandraBot(ForecastBot):
 
     # ======================== ENSEMBLE HELPERS ========================
 
-    async def _call_model_safe(self, model, prompt: str) -> str | None:
+    async def _call_model_safe(
+        self, model, prompt: str, temperature: float | None = None
+    ) -> str | None:
         """Call a model with semaphore and error handling. Returns None on failure."""
         async with self._model_call_semaphore:
             try:
-                return await model.invoke(prompt)
+                return await model.invoke(prompt, temperature=temperature)
             except Exception as e:
                 logger.warning(f"Model {model.name} failed: {e}")
                 return None
+
+    def _days_to_resolution(self, question: MetaculusQuestion) -> float | None:
+        """Days until scheduled resolution/close, if available on the question object."""
+        now = datetime.now(timezone.utc)
+        for attr in (
+            "scheduled_resolution_time",
+            "scheduled_close_time",
+            "close_time",
+            "resolution_date",
+        ):
+            dt = getattr(question, attr, None)
+            if dt is None:
+                continue
+            if isinstance(dt, datetime):
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                delta = (dt - now).total_seconds() / 86400.0
+                return max(0.0, delta)
+        return None
 
     def _assign_perspectives(self, models: list) -> list[tuple]:
         """
@@ -721,7 +871,11 @@ class CassandraBot(ForecastBot):
                 today=today,
                 conditional_disclaimer=conditional_disclaimer,
             )
-            tasks.append(self._call_model_safe(model, prompt))
+            tasks.append(
+                self._call_model_safe(
+                    model, prompt, temperature=PERSPECTIVE_TEMPS[perspective]
+                )
+            )
             task_labels.append(f"{model.name}({perspective})")
 
         responses = await asyncio.gather(*tasks)
@@ -739,21 +893,32 @@ class CassandraBot(ForecastBot):
         if not all_probs:
             raise ValueError("All ensemble models failed for binary question")
 
-        # Aggregate: median + extremize
-        median_prob = statistics.median(all_probs)
-        final_prob = extremize(median_prob, self.EXTREMIZE_FACTOR)
+        # Aggregate: trimmed log-odds mean + horizon-aware extremization
+        trimmed_note = ""
+        if len(all_probs) >= 5:
+            trimmed = sorted(all_probs)[1:-1]
+            trimmed_note = f" (trimmed {len(all_probs)} -> {len(trimmed)})"
+        else:
+            trimmed = all_probs
+
+        agg_prob = aggregate_logits(trimmed)
+        days_left = self._days_to_resolution(question)
+        effective_factor = horizon_scaled_factor(self.EXTREMIZE_FACTOR, days_left)
+        final_prob = extremize(agg_prob, effective_factor)
         final_prob = max(0.01, min(0.99, final_prob))
 
         combined_reasoning = (
             f"## Ensemble Forecast ({len(all_probs)} models)\n"
             f"Individual predictions: {[f'{p:.1%}' for p in all_probs]}\n"
-            f"Median: {median_prob:.1%} -> Extremized ({self.EXTREMIZE_FACTOR}): {final_prob:.1%}\n\n"
+            f"Aggregated (log-odds){trimmed_note}: {agg_prob:.1%} -> "
+            f"Extremized (factor={effective_factor:.2f}, days={days_left}): {final_prob:.1%}\n\n"
             + "\n\n".join(all_reasonings)
         )
 
         logger.info(
             f"Binary ensemble for {question.page_url}: "
-            f"preds={[round(p,3) for p in all_probs]} median={median_prob:.3f} final={final_prob:.3f}"
+            f"preds={[round(p,3) for p in all_probs]} agg={agg_prob:.3f} "
+            f"factor={effective_factor:.2f} final={final_prob:.3f}"
         )
         return ReasonedPrediction(prediction_value=final_prob, reasoning=combined_reasoning)
 
@@ -766,10 +931,16 @@ class CassandraBot(ForecastBot):
         conditional_disclaimer = self._get_conditional_disclaimer_if_necessary(question)
         model_assignments = self._assign_perspectives(self.ensemble_models)
 
+        prompt_templates = {
+            "outside": MC_OUTSIDE_VIEW,
+            "inside": MC_INSIDE_VIEW,
+            "advocate": MC_DEVILS_ADVOCATE,
+        }
+
         tasks = []
         task_labels = []
         for model, perspective in model_assignments:
-            prompt = MC_PROMPT.format(
+            prompt = prompt_templates[perspective].format(
                 question_text=question.question_text,
                 options=question.options,
                 background_info=question.background_info or "",
@@ -777,10 +948,13 @@ class CassandraBot(ForecastBot):
                 fine_print=question.fine_print or "",
                 research=research,
                 today=today,
-                view_instruction=VIEW_INSTRUCTIONS[perspective],
                 conditional_disclaimer=conditional_disclaimer,
             )
-            tasks.append(self._call_model_safe(model, prompt))
+            tasks.append(
+                self._call_model_safe(
+                    model, prompt, temperature=PERSPECTIVE_TEMPS[perspective]
+                )
+            )
             task_labels.append(f"{model.name}({perspective})")
 
         responses = await asyncio.gather(*tasks)
@@ -838,10 +1012,16 @@ class CassandraBot(ForecastBot):
         conditional_disclaimer = self._get_conditional_disclaimer_if_necessary(question)
         model_assignments = self._assign_perspectives(self.ensemble_models)
 
+        prompt_templates = {
+            "outside": NUMERIC_OUTSIDE_VIEW,
+            "inside": NUMERIC_INSIDE_VIEW,
+            "advocate": NUMERIC_DEVILS_ADVOCATE,
+        }
+
         tasks = []
         task_labels = []
         for model, perspective in model_assignments:
-            prompt = NUMERIC_PROMPT.format(
+            prompt = prompt_templates[perspective].format(
                 question_text=question.question_text,
                 background_info=question.background_info or "",
                 resolution_criteria=question.resolution_criteria or "",
@@ -851,10 +1031,13 @@ class CassandraBot(ForecastBot):
                 today=today,
                 lower_bound_message=lower_bound_message,
                 upper_bound_message=upper_bound_message,
-                view_instruction=VIEW_INSTRUCTIONS[perspective],
                 conditional_disclaimer=conditional_disclaimer,
             )
-            tasks.append(self._call_model_safe(model, prompt))
+            tasks.append(
+                self._call_model_safe(
+                    model, prompt, temperature=PERSPECTIVE_TEMPS[perspective]
+                )
+            )
             task_labels.append(f"{model.name}({perspective})")
 
         responses = await asyncio.gather(*tasks)
@@ -941,10 +1124,16 @@ Text to extract from:
         conditional_disclaimer = self._get_conditional_disclaimer_if_necessary(question)
         model_assignments = self._assign_perspectives(self.ensemble_models)
 
+        prompt_templates = {
+            "outside": DATE_OUTSIDE_VIEW,
+            "inside": DATE_INSIDE_VIEW,
+            "advocate": DATE_DEVILS_ADVOCATE,
+        }
+
         tasks = []
         task_labels = []
         for model, perspective in model_assignments:
-            prompt = DATE_PROMPT.format(
+            prompt = prompt_templates[perspective].format(
                 question_text=question.question_text,
                 background_info=question.background_info or "",
                 resolution_criteria=question.resolution_criteria or "",
@@ -955,7 +1144,11 @@ Text to extract from:
                 upper_bound_message=upper_bound_message,
                 conditional_disclaimer=conditional_disclaimer,
             )
-            tasks.append(self._call_model_safe(model, prompt))
+            tasks.append(
+                self._call_model_safe(
+                    model, prompt, temperature=PERSPECTIVE_TEMPS[perspective]
+                )
+            )
             task_labels.append(f"{model.name}({perspective})")
 
         responses = await asyncio.gather(*tasks)
@@ -987,7 +1180,7 @@ Text to extract from:
         if not all_date_sets:
             # Fallback to single Foresight call
             logger.warning("Date ensemble failed, falling back to single Foresight call")
-            prompt = DATE_PROMPT.format(
+            prompt = DATE_INSIDE_VIEW.format(
                 question_text=question.question_text,
                 background_info=question.background_info or "",
                 resolution_criteria=question.resolution_criteria or "",
@@ -1172,6 +1365,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
+    # Active seasonal tournament. Override the `forecasting-tools` constant
+    # because that package's CURRENT_AI_COMPETITION_ID lags behind new seasons.
+    SUMMER_2026_TOURNAMENT_ID = "summer-futureeval-2026"
+
     # ============================================================
     # Initialize ensemble
     # Models are auto-detected from environment variables.
@@ -1208,7 +1405,7 @@ if __name__ == "__main__":
     if run_mode == "tournament":
         seasonal_reports = asyncio.run(
             cassandra_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+                SUMMER_2026_TOURNAMENT_ID, return_exceptions=True
             )
         )
         minibench_reports = asyncio.run(
