@@ -1,4 +1,4 @@
-name: Check API credits
+name: Check API access
 on:
   workflow_dispatch:
 
@@ -6,10 +6,27 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install poetry
+        run: pipx install poetry
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
       - name: OpenRouter balance
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           curl -s https://openrouter.ai/api/v1/key \
             -H "Authorization: Bearer $OPENROUTER_API_KEY" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin).get('data',{}); print('limit:', d.get('limit')); print('remaining:', d.get('limit_remaining')); print('usage:', d.get('usage'))"
+            | python3 -c "import sys,json; d=json.load(sys.stdin).get('data',{}); print('limit:', d.get('limit')); print('remaining:', d.get('limit_remaining'))"
+
+      - name: AskNews
+        env:
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+        run: poetry run python check_asknews.py
