@@ -29,4 +29,15 @@ jobs:
       - name: AskNews
         env:
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
-        run: poetry run python check_asknews.py
+        run: |
+          poetry run python -c "
+          import os, asyncio
+          from forecasting_tools import AskNewsSearcher
+          print('key present:', bool(os.getenv('ASKNEWS_API_KEY')))
+          async def main():
+              s = AskNewsSearcher()
+              r = await s.call_preconfigured_version('asknews/news-summaries', 'Bitcoin price news August 2026')
+              print('SUCCESS, got', len(r), 'chars')
+              print(r[:600])
+          asyncio.run(main())
+          "
