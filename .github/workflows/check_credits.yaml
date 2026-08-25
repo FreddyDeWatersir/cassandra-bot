@@ -1,0 +1,15 @@
+name: Check API credits
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: OpenRouter balance
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          curl -s https://openrouter.ai/api/v1/key \
+            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin).get('data',{}); print('limit:', d.get('limit')); print('remaining:', d.get('limit_remaining')); print('usage:', d.get('usage'))"
