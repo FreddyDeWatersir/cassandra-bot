@@ -102,7 +102,7 @@ result = odds ** factor / (1 + odds ** factor)
 
 This is well established in the forecasting literature and is roughly the highest-return single intervention available for LLM forecasting calibration.
 
-### Scale extremization by horizon (the part I have not seen elsewhere)
+### Scale extremization by horizon 
 
 A fixed extremization factor applied to every question is wrong in a specific way. It assumes all underconfidence is an artifact of averaging. But on a question resolving in eighteen months, a model's uncertainty is often *correct*: the world genuinely has not decided yet. Sharpening those forecasts converts real uncertainty into false confidence, and under a log scoring rule that is the most expensive mistake available.
 
@@ -129,27 +129,6 @@ Six models given identical prompts produce correlated errors, because they share
 
 Low temperature for base-rate reasoning where you want the modal answer, high temperature for adversarial reasoning where you want the unusual scenario. The intent is decorrelated errors rather than six restatements of the same prior.
 
----
-
-## What broke, and what it taught me
-
-The research layer failed during Summer in a way I think is more instructive than any of the parts that worked.
-
-AskNews access lapsed at the season boundary, so the pipeline fell through to its second tier: an LLM asked to summarise relevant news. That model has no web access. Rather than reporting that it could not help, it produced fluent, confident, well-structured research describing market conditions from its training data and presented them as current. That text then entered all six forecasting prompts under the heading `Your research assistant says:`.
-
-Extract from a real run, forecasting a Bitcoin price question in August 2026:
-
-> "as of October 2023 ... Bitcoin fluctuating between $25,000 and $35,000"
-
-The actual price that week was around $77,000.
-
-Two things are worth drawing out. The first is that the failure was invisible in the logs. Every stage reported success. `AskNews research failed` appeared as a warning, the fallback returned 2,147 characters of plausible text, and the bot posted a forecast with no error. A monitoring setup that checks whether stages completed would have shown a fully green pipeline.
-
-The second is that the ensemble partially saved itself. The models mostly ignored the false context and reasoned from figures in the Metaculus question background instead. That is luck, not design: on a question with a thinner background there is nothing to correct against, and six frontier models would have confidently anchored on a fabrication.
-
-The lesson I actually took is about failure modes rather than about news APIs. A fallback that silently produces *worse-than-nothing* output is more dangerous than one that fails loudly, because a degraded output looks exactly like a working one. The fixes are a search-backed fallback so the degraded path still touches reality, provenance logging so every forecast records which research tier produced its context, and a fail-loud path when no tier had live search.
-
----
 
 ## Known limitations
 
